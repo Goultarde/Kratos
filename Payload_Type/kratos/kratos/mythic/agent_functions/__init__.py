@@ -6,3 +6,4 @@ from .getuid import *
 from .pwd import *
 from .cd import *
 from .ls import *
+from .sleep import *

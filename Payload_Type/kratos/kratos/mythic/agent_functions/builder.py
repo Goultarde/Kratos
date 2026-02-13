@@ -1,5 +1,6 @@
 import logging
 import pathlib
+import base64
 from mythic_container.PayloadBuilder import *
 from mythic_container.MythicCommandBase import *
 from mythic_container.MythicRPC import *
@@ -69,8 +70,68 @@ class Kratos(PayloadType):
             # User Agent extraction
             headers = c2_conf.get("headers", {})
             user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36"
+            headers_str = ""
             if isinstance(headers, dict):
                  user_agent = headers.get("User-Agent", user_agent)
+                 for key, val in headers.items():
+                     if key == "User-Agent":
+                         continue
+                     headers_str += f"{key}: {val}\\r\\n"
+            
+            if not headers_str:
+                headers_str = ""
+            
+            aes_psk = c2_conf.get("AESPSK", "")
+            
+            # DEBUG: Log the raw AESPSK value
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Extracting AESPSK",
+                StepStdout=f"Raw AESPSK from c2_conf: Type={type(aes_psk).__name__}, Value={repr(aes_psk)[:200]}",
+                StepSuccess=True
+            ))
+            
+            # AESPSK can be:
+            # 1. A dict with {"value": "aes256_hmac", "enc_key": [bytes...], "dec_key": [bytes...]}
+            # 2. Just a string like "none" or "aes256_hmac"
+            if isinstance(aes_psk, dict):
+                 if "enc_key" in aes_psk and aes_psk["enc_key"] is not None:
+                     # enc_key is a list of bytes from Mythic
+                     enc_key_bytes = aes_psk["enc_key"]
+                     
+                     # Convert list of ints to bytes, then to Base64
+                     if isinstance(enc_key_bytes, list):
+                         # Mythic sends bytes as array of integers
+                         key_bytes = bytes(enc_key_bytes)
+                     elif isinstance(enc_key_bytes, bytes):
+                         key_bytes = enc_key_bytes
+                     else:
+                         key_bytes = base64.b64decode(enc_key_bytes)
+                     
+                     # Encode to Base64 string for the agent
+                     aes_psk = base64.b64encode(key_bytes).decode('ascii')
+                 elif "value" in aes_psk:
+                     # If value is "none", we don't need a key
+                     aes_psk = aes_psk["value"]
+                     if aes_psk != "none":
+                         # "aes256_hmac" without enc_key means something went wrong
+                         raise Exception(f"AESPSK type is {aes_psk} but no enc_key was provided by Mythic")
+                 else:
+                     aes_psk = str(aes_psk)
+            
+            if aes_psk and isinstance(aes_psk, str):
+                aes_psk = aes_psk.strip()
+            
+            # DEBUG: Log the extracted key
+            await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                PayloadUUID=self.uuid,
+                StepName="Extracted AES Key",
+                StepStdout=f"Final AESPSK: Type={type(aes_psk).__name__}, Length={len(aes_psk) if aes_psk else 0}, First20={aes_psk[:20] if aes_psk and len(aes_psk) > 0 else 'EMPTY'}",
+                StepSuccess=True
+            ))
+                
+            encrypted_exchange_check = c2_conf.get("encrypted_exchange_check", False)
+            encrypted_exchange_val = "1" if encrypted_exchange_check else "0"
 
             is_debug = self.get_parameter("debug")
             debug_val = 1 if is_debug else 0
@@ -80,14 +141,17 @@ class Kratos(PayloadType):
             with open(config_path, "r") as f:
                 config_content = f.read()
             
-            # Perform replacements (Xenon Style) - Handle potential spaces
+            # Perform replacements - Handle potential spaces
             config_content = config_content.replace("%AGENT_UUID%", self.uuid).replace("% AGENT_UUID %", self.uuid)
+            config_content = config_content.replace("%HEADERS%", headers_str)
             config_content = config_content.replace("%CALLBACK_HOST%", callback_host).replace("% CALLBACK_HOST %", callback_host)
             config_content = config_content.replace("%CALLBACK_PORT%", str(callback_port)).replace("% CALLBACK_PORT %", str(callback_port))
             config_content = config_content.replace("%POST_URI%", post_uri).replace("% POST_URI %", post_uri)
             config_content = config_content.replace("%USER_AGENT%", user_agent).replace("% USER_AGENT %", user_agent)
             config_content = config_content.replace("%SLEEP_TIME%", str(callback_interval)).replace("% SLEEP_TIME %", str(callback_interval))
             config_content = config_content.replace("%DEBUG_VAL%", str(debug_val)).replace("% DEBUG_VAL %", str(debug_val))
+            config_content = config_content.replace("%AESPSK%", aes_psk).replace("% AESPSK %", aes_psk)
+            config_content = config_content.replace("%ENCRYPTED_EXCHANGE%", encrypted_exchange_val).replace("% ENCRYPTED_EXCHANGE %", encrypted_exchange_val)
 
             # Write the patched content back
             with open(config_path, "w") as f:

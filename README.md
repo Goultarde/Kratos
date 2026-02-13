@@ -1,4 +1,7 @@
-# Kratos
+<p align="center">
+  <img src="Payload_Type/kratos/kratos/mythic/agent_functions/kratos.svg" alt="Kratos Logo" height="200" width="200">
+  <h1 align="center">Kratos</h1>
+</p>
 
 Kratos is a minimalist C2 agent written in C for Mythic, targeting Windows environments. It is designed to be lightweight, modular, and easily extensible.
 
@@ -14,6 +17,13 @@ Kratos is a minimalist C2 agent written in C for Mythic, targeting Windows envir
 
 - **http**: Uses standard HTTP/HTTPS for communication.
 
+## Encryption Support
+
+⚠️ **Important**: AES encryption is **NOT supported** in the current version. 
+- When creating a payload, set `AESPSK` to **`none`**
+- All communication is transmitted in **plaintext** (Base64-encoded)
+- This agent is intended for testing and educational purposes only
+
 ## Supported Commands
 
 The agent supports dynamic command selection. If a command is not selected during payload creation, its code will not be compiled into the final executable.
@@ -26,5 +36,6 @@ The agent supports dynamic command selection. If a command is not selected durin
 | **ls** | `ls [path]` | Lists files and directories (wrapper around dir). |
 | **pwd** | `pwd` | Displays the current working directory path. |
 | **getuid** | `getuid` | Retrieves the current user name. |
+| **sleep** | `sleep [interval]` | Get or set callback interval in seconds. No args = show current value. |
 | **exit** | `exit` | Terminates the agent cleanly. |
 
