@@ -1,0 +1,14 @@
+{
+  "os": ["Windows"],
+  "languages": ["C"],
+  "features": {
+    "mythic": ["artifacts", "docker", "file chunking", "file browser", "rpfwd", "socks"],
+    "custom": ["key exchange", "killdate"]
+  },
+  "payload_output": ["exe"],
+  "architectures": ["x86_64", "arm_64"],
+  "c2":[],
+  "mythic_version": "v3.4.21",
+  "agent_version": "1.0.0",
+  "supported_wrappers": []
+}
