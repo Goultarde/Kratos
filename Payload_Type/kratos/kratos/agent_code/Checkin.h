@@ -6,6 +6,6 @@
 
 // Sends the initial checkin to Mythic
 // Returns TRUE if checkin was successful (and UUID potentially updated)
-BOOL CheckinSend();
+BOOL CheckinSend(char *override_user);
 
 #endif

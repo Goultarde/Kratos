@@ -7,3 +7,16 @@ from .pwd import *
 from .cd import *
 from .ls import *
 from .sleep import *
+from .cat import *
+from .cp import *
+from .mv import *
+from .rm import *
+from .mkdir import *
+from .ps import *
+from .kill import *
+from .whoami import *
+from .ifconfig import *
+from .download import *
+from .upload import *
+from .steal_token import *
+from .rev2self import *

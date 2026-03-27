@@ -2,6 +2,10 @@
 #define KRATOS_UTILS_H
 
 #include <stddef.h>
+#include <windows.h>
+
+/* Token primaire volé via steal_token, NULL si aucun. */
+extern HANDLE g_stolen_token;
 
 char *base64_encode(const unsigned char *src, size_t len);
 char *base64_decode(const char *src, size_t len);
@@ -16,5 +20,7 @@ char *
 process_mythic_response(const char *b64_resp,
                         size_t b64_len); // Returns malloc'd JSON string or NULL
 void send_task_response(const char *task_id, const char *raw_output);
+int get_integrity_level();
+void get_current_display_user(char *display_buffer, size_t size);
 
 #endif // KRATOS_UTILS_H
