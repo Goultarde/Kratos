@@ -10,7 +10,7 @@ Stop one or all active ligolo-ng sessions.
 ## Arguments
 | Name | Required | Description |
 |------|----------|-------------|
-| `remote_path` | No | Path of the session to stop. Leave blank to kill all sessions. |
+| `pid` | No | PID of the session to stop. 0 (default) kills all sessions. |
 
 ## Usage
 
@@ -19,11 +19,11 @@ Stop one or all active ligolo-ng sessions.
 ligolo_stop
 ```
 
-**Stop a specific session:**
+**Stop a specific session by PID:**
 ```
-ligolo_stop C:\Windows\Temp\svchost32.exe
+ligolo_stop -PID 1234
 ```
 
 ## Notes
-- `remote_path` matches the drop path used when the session was started.
-- The stop button in the `ligolo_status` panel automatically fills the correct path.
+- The stop button in the `ligolo_status` panel automatically passes the correct PID.
+- PID 0 terminates all tracked sessions.

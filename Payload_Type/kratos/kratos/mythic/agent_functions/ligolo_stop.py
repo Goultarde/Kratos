@@ -6,12 +6,12 @@ class LigoloStopArguments(TaskArguments):
         super().__init__(command_line, **kwargs)
         self.args = [
             CommandParameter(
-                name="remote_path",
-                cli_name="RemotePath",
-                display_name="Session Path (blank = kill all)",
-                type=ParameterType.String,
-                default_value="",
-                description="Path of the ligolo-ng binary to stop. Leave blank to kill all sessions.",
+                name="pid",
+                cli_name="PID",
+                display_name="PID (0 = kill all)",
+                type=ParameterType.Number,
+                default_value=0,
+                description="PID of the ligolo-ng session to stop. 0 kills all sessions.",
                 parameter_group_info=[ParameterGroupInfo(required=False, ui_position=0)],
             ),
         ]
@@ -23,14 +23,17 @@ class LigoloStopArguments(TaskArguments):
         if cmd.startswith("{"):
             self.load_args_from_json_string(cmd)
         else:
-            self.add_arg("remote_path", cmd)
+            try:
+                self.add_arg("pid", int(cmd))
+            except ValueError:
+                pass
 
 
 class LigoloStopCommand(CommandBase):
     cmd = "ligolo_stop"
     needs_admin = False
-    help_cmd = "ligolo_stop  |  ligolo_stop C:\\Windows\\Temp\\svchost32.exe"
-    description = "Stop a ligolo-ng session. Leave path blank to kill all sessions."
+    help_cmd = "ligolo_stop  |  ligolo_stop -PID 1234"
+    description = "Stop a ligolo-ng session by PID. PID 0 kills all sessions."
     version = 1
     author = "@goultarde"
     argument_class = LigoloStopArguments
@@ -41,12 +44,12 @@ class LigoloStopCommand(CommandBase):
     async def create_go_tasking(
         self, taskData: PTTaskMessageAllData
     ) -> PTTaskCreateTaskingMessageResponse:
-        remote_path = taskData.args.get_arg("remote_path") or ""
+        pid = taskData.args.get_arg("pid") or 0
         response = PTTaskCreateTaskingMessageResponse(
             TaskID=taskData.Task.ID,
             Success=True,
         )
-        response.DisplayParams = f"stop {remote_path}" if remote_path else "stop all"
+        response.DisplayParams = f"stop PID {pid}" if pid else "stop all"
         return response
 
     async def process_response(

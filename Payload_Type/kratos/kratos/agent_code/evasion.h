@@ -26,4 +26,13 @@ NTSTATUS kratos_NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess
                                  ULONG CreateFlags, SIZE_T ZeroBits,
                                  SIZE_T StackSize, SIZE_T MaximumStackSize,
                                  PVOID AttributeList);
+
+NTSTATUS kratos_NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
+                                     PVOID Buffer, SIZE_T NumberOfBytesToWrite,
+                                     PSIZE_T NumberOfBytesWritten);
+
+NTSTATUS kratos_NtQueueApcThread(HANDLE ThreadHandle, PVOID ApcRoutine,
+                                  PVOID ApcArgument1, PVOID ApcArgument2,
+                                  PVOID ApcArgument3);
+
 #endif /* EVASION_SYSCALLS */

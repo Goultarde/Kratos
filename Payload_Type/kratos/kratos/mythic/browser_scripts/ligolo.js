@@ -52,7 +52,7 @@ function(task, responses){
                         "name": "Stop session",
                         "type": "task",
                         "ui_feature": "ligolo:stop",
-                        "parameters": JSON.stringify({"remote_path": s["path"]})
+                        "parameters": JSON.stringify({"pid": s["pid"]})
                     },
                     {
                         "name": "Copy connect string",

