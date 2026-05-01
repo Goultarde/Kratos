@@ -29,3 +29,4 @@ from .ligolo_status import *
 from .rportfwd import *
 from .spawnto import *
 from .spawn import *
+from .spawnas import *

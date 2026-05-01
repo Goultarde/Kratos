@@ -248,6 +248,10 @@ int main() {
                 else if (strcmp(cmd_name, "spawn") == 0)
                   command_spawn(task_id, params);
 #endif
+#ifdef INCLUDE_CMD_SPAWNAS
+                else if (strcmp(cmd_name, "spawnas") == 0)
+                  command_spawnas(task_id, params);
+#endif
               }
               cmd_local_ptr += 1;
             }

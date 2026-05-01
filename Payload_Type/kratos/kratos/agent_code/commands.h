@@ -31,6 +31,7 @@ void command_ligolo_stop(char *task_id, char *params);
 void command_ligolo_status(char *task_id, char *params);
 void command_spawnto(char *task_id, char *params);
 void command_spawn(char *task_id, char *params);
+void command_spawnas(char *task_id, char *params);
 
 /* g_spawnto_path defined in inject.c, shared by spawn/ligolo fork+run */
 

