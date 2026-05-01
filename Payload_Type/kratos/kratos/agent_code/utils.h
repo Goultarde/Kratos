@@ -4,8 +4,12 @@
 #include <stddef.h>
 #include <windows.h>
 
-/* Token primaire volé via steal_token, NULL si aucun. */
+/* Primary token stolen via steal_token, NULL if none. */
 extern HANDLE g_stolen_token;
+extern int g_netonly_active;
+extern char g_netonly_username[256];
+extern char g_netonly_domain[256];
+extern char g_netonly_password[512];
 
 char *base64_encode(const unsigned char *src, size_t len);
 char *base64_decode(const char *src, size_t len);
@@ -22,5 +26,6 @@ process_mythic_response(const char *b64_resp,
 void send_task_response(const char *task_id, const char *raw_output);
 int get_integrity_level();
 void get_current_display_user(char *display_buffer, size_t size);
+void clear_netonly_state(void);
 
 #endif // KRATOS_UTILS_H

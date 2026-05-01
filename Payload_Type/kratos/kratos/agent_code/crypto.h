@@ -3,8 +3,8 @@
 
 #define _WIN32_WINNT 0x0600
 /* clang-format off */
-/* ORDRE CRITIQUE: windows.h doit précéder bcrypt.h
- * Ne pas laisser le formatter réordonner ces deux lignes. */
+/* CRITICAL ORDER: windows.h must precede bcrypt.h
+ * Do not let the formatter reorder these two lines. */
 #include <windows.h>
 #include <bcrypt.h>
 /* clang-format on */
@@ -22,10 +22,10 @@
 /*
  * aes256_encrypt
  *
- * Chiffre `plaintext` (len `plain_len`) avec la clé `aes_key` (32 bytes).
+ * Encrypts `plaintext` (len `plain_len`) with key `aes_key` (32 bytes).
  * Alloue et retourne le buffer: IV + Ciphertext + HMAC
- * *out_len reçoit la taille du buffer retourné.
- * Retourne NULL en cas d'erreur. Le caller doit free() le résultat.
+ * *out_len receives the size of the returned buffer.
+ * Returns NULL on error. Caller must free() the result.
  */
 unsigned char *aes256_encrypt(const unsigned char *aes_key,
                               const unsigned char *plaintext, size_t plain_len,
@@ -34,10 +34,10 @@ unsigned char *aes256_encrypt(const unsigned char *aes_key,
 /*
  * aes256_decrypt
  *
- * Déchiffre `cipherblob` (layout: IV + Ciphertext + HMAC) de taille `blob_len`.
- * Vérifie le HMAC avant de déchiffrer.
- * Retourne un buffer malloc'd (plaintext, null-terminé), ou NULL si erreur/HMAC
- * invalide. *out_len reçoit la longueur du plaintext (sans le \0 final).
+ * Decrypts `cipherblob` (layout: IV + Ciphertext + HMAC) of size `blob_len`.
+ * Verifies HMAC before decrypting.
+ * Returns a malloc'd buffer (plaintext, null-terminated), or NULL on error/HMAC
+ * invalid. *out_len receives the plaintext length (without trailing \0).
  */
 unsigned char *aes256_decrypt(const unsigned char *aes_key,
                               const unsigned char *cipherblob, size_t blob_len,
@@ -46,10 +46,10 @@ unsigned char *aes256_decrypt(const unsigned char *aes_key,
 /*
  * crypto_init_key
  *
- * Décode la clé AESPSK depuis sa représentation base64 en mémoire brute (32
+ * Decodes the AESPSK key from its base64 representation to raw memory (32
  * bytes). `b64_key`  : string base64 (telle que fournie par config.h) `key_out`
- * : buffer de 32 bytes fourni par le caller Retourne 1 si succès, 0 si échec
- * (clé invalide, mode "none", etc.)
+ * : 32-byte buffer provided by the caller. Returns 1 on success, 0 on failure
+ * (invalid key, "none" mode, etc.)
  */
 int crypto_init_key(const char *b64_key, unsigned char key_out[32]);
 

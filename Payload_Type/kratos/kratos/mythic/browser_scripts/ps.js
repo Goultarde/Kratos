@@ -33,12 +33,15 @@ function(task, responses){
             let p = data[j];
             let rowStyle = {};
             let name = p["name"] || "";
+            let baseName = name.replace(/\.exe$/i, "");
 
-            if(avProcesses.some(av => name.toLowerCase() === av.toLowerCase())){
+            if(p["is_agent"]){
+                rowStyle = {backgroundColor: "gold", color: "black"};
+            } else if(avProcesses.some(av => baseName.toLowerCase() === av.toLowerCase())){
                 rowStyle = {backgroundColor: "indianred", color: "black"};
-            } else if(adminTools.some(t => name.toLowerCase() === t.toLowerCase())){
+            } else if(adminTools.some(t => baseName.toLowerCase() === t.toLowerCase())){
                 rowStyle = {backgroundColor: "rgb(106,255,255)", color: "black"};
-            } else if(name === "explorer" || name === "winlogon"){
+            } else if(baseName === "explorer" || baseName === "winlogon"){
                 rowStyle = {backgroundColor: "cornflowerblue", color: "black"};
             }
 

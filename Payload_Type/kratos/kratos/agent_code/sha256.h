@@ -1,5 +1,5 @@
 /*
- * sha256.h — SHA-256 + HMAC-SHA256 (domaine public, zéro dépendance)
+ * sha256.h -- SHA-256 + HMAC-SHA256 (public domain, zero dependencies)
  */
 #ifndef KRATOS_SHA256_H
 #define KRATOS_SHA256_H

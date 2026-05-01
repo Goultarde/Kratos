@@ -9,8 +9,8 @@
 void command_getuid(char *task_id, char *params) {
   (void)params;
 
-  /* Si un token volé est actif, on l'interroge directement
-   * plutôt que GetUserNameA (qui lit le token du processus). */
+  /* If a stolen token is active, query it directly
+   * instead of GetUserNameA (which reads the process token). */
   if (g_stolen_token != NULL) {
     char username[256] = {0};
     char domain[256] = {0};

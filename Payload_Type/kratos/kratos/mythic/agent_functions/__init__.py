@@ -19,4 +19,13 @@ from .ifconfig import *
 from .download import *
 from .upload import *
 from .steal_token import *
+from .make_token import *
+from .runas import *
 from .rev2self import *
+from .socks import *
+from .ligolo_start import *
+from .ligolo_stop import *
+from .ligolo_status import *
+from .rportfwd import *
+from .spawnto import *
+from .spawn import *

@@ -17,7 +17,7 @@ class PsCommand(CommandBase):
     description = "List running processes with PID, PPID, user, architecture and full path."
     version = 1
     author = "@goultarde"
-    # Requis pour que Mythic route les données "processes" vers le process browser
+    # Required for Mythic to route "processes" data to the process browser
     supported_ui_features = ["process_browser:list"]
     browser_script = BrowserScript(script_name="ps", author="@goultarde")
     argument_class = PsArguments

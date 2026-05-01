@@ -1,20 +1,20 @@
 /*
  * crypto.c — AES-256-CBC + HMAC-SHA256
  *
- * Deux backends sélectionnables à la compilation :
- *   -DUSE_BCRYPT   → Windows BCrypt API (bcrypt.dll en import)
- *   -DUSE_TINY_AES → tiny-AES-c + SHA-256 maison (zéro import DLL crypto)
+ * Two backends selectable at compile time:
+ *   -DUSE_BCRYPT   -> Windows BCrypt API (bcrypt.dll import)
+ *   -DUSE_TINY_AES -> tiny-AES-c + homemade SHA-256 (zero crypto DLL import)
  *
  * Format Mythic : [IV 16B] [Ciphertext] [HMAC-SHA256 32B]
- * HMAC calculé sur (IV + Ciphertext). Padding PKCS7.
+ * HMAC computed over (IV + Ciphertext). PKCS7 padding.
  */
 
 #if defined(USE_TINY_AES)
-/* ──── Backend tiny-AES : zéro import DLL crypto ──────────────────────
- * Utilise aes.c + sha256.c compilés dans le binaire.
- * IV généré via CryptGenRandom (advapi32 — déjà importé partout).
+/* ---- Backend tiny-AES: zero crypto DLL import ---------------------
+ * Uses aes.c + sha256.c compiled into the binary.
+ * IV generated via CryptGenRandom (advapi32 - already imported everywhere).
  * ──────────────────────────────────────────────────────────────────── */
-/* AES256=1 CBC=1 ECB=0 CTR=0 injectés via Makefile AES_DEFINES (tous les .c) */
+/* AES256=1 CBC=1 ECB=0 CTR=0 injected via Makefile AES_DEFINES (all .c files) */
 #include "aes.h"
 #include "sha256.h"
 #include "utils.h"
@@ -28,7 +28,7 @@
 #define HMAC_SIZE 32
 #define IV_SIZE 16
 
-/* RtlGenRandom chargé dynamiquement (SystemFunction036 dans advapi32)
+/* RtlGenRandom loaded dynamically (SystemFunction036 in advapi32)
  * — ni wincrypt.h ni bcrypt.h requis, aucun import statique visible */
 typedef BOOLEAN(WINAPI *RtlGenRandom_t)(PVOID, ULONG);
 
@@ -164,7 +164,7 @@ int crypto_init_key(const char *b64_key, unsigned char key_out[32]) {
 
 #elif defined(USE_BCRYPT)
 /* ──── Backend BCrypt (Windows API) ───────────────────────────────────
- * crypto.h inclut déjà windows.h + bcrypt.h dans le bon ordre.
+ * crypto.h already includes windows.h + bcrypt.h in the correct order.
  * ──────────────────────────────────────────────────────────────────── */
 #include "crypto.h"
 #include "utils.h"
@@ -184,7 +184,7 @@ int crypto_init_key(const char *b64_key, unsigned char key_out[32]) {
  * Helpers internes
  * ────────────────────────────────────────────────────────────────── */
 
-/* Génère `len` octets aléatoires cryptographiquement sûrs */
+/* Generates `len` cryptographically secure random bytes */
 static int rand_bytes(unsigned char *buf, size_t len) {
   BCRYPT_ALG_HANDLE hAlg = NULL;
   NTSTATUS status =
@@ -202,7 +202,7 @@ static int rand_bytes(unsigned char *buf, size_t len) {
 
 /*
  * Calcule HMAC-SHA256(key, data) → out[32]
- * Retourne 1 si succès, 0 si erreur.
+ * Returns 1 on success, 0 on error.
  */
 static int hmac_sha256(const unsigned char *key, size_t key_len,
                        const unsigned char *data, size_t data_len,
@@ -240,7 +240,7 @@ cleanup:
   return ret;
 }
 
-/* Comparaison en temps constant pour éviter les timing attacks */
+/* Constant-time comparison to prevent timing attacks */
 static int secure_memcmp(const unsigned char *a, const unsigned char *b,
                          size_t n) {
   unsigned char diff = 0;
@@ -285,7 +285,7 @@ unsigned char *aes256_encrypt(const unsigned char *aes_key,
   if (!BCRYPT_SUCCESS(status))
     goto cleanup;
 
-  /* --- Taille objet clé --- */
+  /* --- Key object size --- */
   status = BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObj,
                              sizeof(ULONG), &cbData, 0);
   if (!BCRYPT_SUCCESS(status))
@@ -295,13 +295,13 @@ unsigned char *aes256_encrypt(const unsigned char *aes_key,
   if (!pbKeyObj)
     goto cleanup;
 
-  /* --- Importer la clé --- */
+  /* --- Import the key --- */
   status = BCryptGenerateSymmetricKey(hAlg, &hKey, pbKeyObj, cbKeyObj,
                                       (PUCHAR)aes_key, AES_KEY_SIZE, 0);
   if (!BCRYPT_SUCCESS(status))
     goto cleanup;
 
-  /* --- Générer l'IV aléatoire --- */
+  /* --- Generate random IV --- */
   unsigned char iv[IV_SIZE];
   if (!rand_bytes(iv, IV_SIZE))
     goto cleanup;
@@ -318,7 +318,7 @@ unsigned char *aes256_encrypt(const unsigned char *aes_key,
   ULONG cbCipher = 0;
   status = BCryptEncrypt(hKey, padded, (ULONG)padded_len, NULL, iv_copy,
                          IV_SIZE, cipher, (ULONG)padded_len, &cbCipher,
-                         0); /* 0 = pas de re-padding BCrypt, on a déjà paddé */
+                         0); /* 0 = no BCrypt re-padding, already padded */
   if (!BCRYPT_SUCCESS(status)) {
     free(cipher);
     goto cleanup;
@@ -367,7 +367,7 @@ cleanup:
 }
 
 /* ──────────────────────────────────────────────────────────────────
- * AES-256-CBC déchiffrement
+ * AES-256-CBC decryption
  * ────────────────────────────────────────────────────────────────── */
 
 unsigned char *aes256_decrypt(const unsigned char *aes_key,
@@ -382,7 +382,7 @@ unsigned char *aes256_decrypt(const unsigned char *aes_key,
   const unsigned char *cipher = cipherblob + IV_SIZE;
   const unsigned char *hmac_recv = cipherblob + IV_SIZE + cipher_len;
 
-  /* --- Vérification HMAC --- */
+  /* --- HMAC verification --- */
   unsigned char hmac_calc[HMAC_SIZE];
   if (!hmac_sha256(aes_key, AES_KEY_SIZE, cipherblob, IV_SIZE + cipher_len,
                    hmac_calc))
@@ -391,7 +391,7 @@ unsigned char *aes256_decrypt(const unsigned char *aes_key,
   if (!secure_memcmp(hmac_calc, hmac_recv, HMAC_SIZE))
     return NULL; /* HMAC invalide → message tampered */
 
-  /* --- Déchiffrement AES-CBC --- */
+  /* --- AES-CBC decryption --- */
   BCRYPT_ALG_HANDLE hAlg = NULL;
   BCRYPT_KEY_HANDLE hKey = NULL;
   unsigned char *pbKeyObj = NULL;
@@ -448,7 +448,7 @@ unsigned char *aes256_decrypt(const unsigned char *aes_key,
   }
   ULONG pad = plain[cbPlain - 1];
 
-  /* Vérifier que tous les octets de padding sont corrects */
+  /* Verify all padding bytes are correct */
   for (ULONG i = 0; i < pad; i++) {
     if (plain[cbPlain - 1 - i] != (unsigned char)pad) {
       free(plain);
@@ -471,7 +471,7 @@ dec_cleanup:
 }
 
 /* ──────────────────────────────────────────────────────────────────
- * Initialisation de la clé depuis base64
+ * Key initialization from base64
  * ────────────────────────────────────────────────────────────────── */
 
 int crypto_init_key(const char *b64_key, unsigned char key_out[32]) {
@@ -480,7 +480,7 @@ int crypto_init_key(const char *b64_key, unsigned char key_out[32]) {
 
   /* Mode plaintext explicite */
   if (strcmp(b64_key, "none") == 0 ||
-      strcmp(b64_key, "aes256_hmac") == 0) /* stub non résolu → pas de clé */
+      strcmp(b64_key, "aes256_hmac") == 0) /* unresolved stub -> no key */
     return 0;
 
   size_t key_len = 0;

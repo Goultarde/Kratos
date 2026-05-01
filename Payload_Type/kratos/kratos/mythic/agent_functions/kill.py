@@ -17,11 +17,19 @@ class KillArguments(TaskArguments):
         ]
 
     async def parse_arguments(self):
-        if len(self.command_line) > 0:
-            if self.command_line[0] == "{":
-                self.load_args_from_json_string(self.command_line)
+        if len(self.command_line) == 0:
+            raise Exception("No PID given.")
+        if self.command_line[0] == "{":
+            import json
+            d = json.loads(self.command_line)
+            if "pid" in d:
+                self.add_arg("pid", d["pid"])
+            elif "process_id" in d:
+                self.add_arg("pid", d["process_id"])
             else:
-                self.add_arg("pid", int(self.command_line.strip()))
+                self.load_args_from_json_string(self.command_line)
+        else:
+            self.add_arg("pid", int(self.command_line.strip()))
 
 
 class KillCommand(CommandBase):
@@ -32,6 +40,7 @@ class KillCommand(CommandBase):
     version = 1
     author = "@goultarde"
     argument_class = KillArguments
+    supported_ui_features = ["kill", "process_browser:kill"]
     attributes = CommandAttributes(
         supported_os=[SupportedOS.Windows],
     )
