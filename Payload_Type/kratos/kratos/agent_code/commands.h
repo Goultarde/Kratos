@@ -32,4 +32,6 @@ void command_ligolo_status(char *task_id, char *params);
 void command_spawnto(char *task_id, char *params);
 void command_spawn(char *task_id, char *params);
 
+extern char g_spawnto_path[512];
+
 #endif // KRATOS_COMMANDS_H

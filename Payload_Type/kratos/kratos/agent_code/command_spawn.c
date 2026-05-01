@@ -18,7 +18,7 @@
 #define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS 0x00020000
 #endif
 
-static char g_spawnto_path[512] = SPAWN_DEFAULT_PATH;
+char g_spawnto_path[512] = SPAWN_DEFAULT_PATH;
 
 #endif /* INCLUDE_CMD_SPAWN || INCLUDE_CMD_SPAWNTO */
 
