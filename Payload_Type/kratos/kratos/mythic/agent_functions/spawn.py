@@ -16,6 +16,15 @@ class SpawnArguments(TaskArguments):
                 dynamic_query_function=self.get_shellcode_payloads,
                 description="Kratos shellcode payload to inject into the spawnto process",
             ),
+            CommandParameter(
+                name="chunk_size_mb",
+                cli_name="ChunkSizeMB",
+                display_name="Chunk Size (MB)",
+                type=ParameterType.Number,
+                default_value=4,
+                description="Shellcode download chunk size in MB. Larger = fewer round-trips = faster.",
+                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=1)],
+            ),
         ]
 
     async def get_shellcode_payloads(self, inputMsg: PTRPCDynamicQueryFunctionMessage) -> PTRPCDynamicQueryFunctionMessageResponse:
@@ -132,6 +141,8 @@ class SpawnCommand(CommandBase):
         else:
             taskData.args.add_arg("shellcode_md5", "", ParameterType.String)
 
+        chunk_size_mb = int(taskData.args.get_arg("chunk_size_mb") or 4)
+        taskData.args.add_arg("sc_chunk_size", chunk_size_mb * 1024 * 1024, ParameterType.Number)
         taskData.args.add_arg("file", file_id, ParameterType.String)
         taskData.args.remove_arg("template")
         return response

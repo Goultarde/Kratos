@@ -23,6 +23,7 @@ Start a ligolo-ng agent session. Two modes available:
 | `user_agent` | No | Custom HTTP User-Agent |
 | `verbose` | No | Verbose output (default: false) |
 | `fork_run` | No | Inject in-memory via Early Bird APC instead of dropping to disk (default: true) |
+| `chunk_size_mb` | No | Shellcode download chunk size in MB - fork+run only (default: 4). Larger = fewer round-trips = faster. |
 
 \* One of `connect` or `bind` is required.
 

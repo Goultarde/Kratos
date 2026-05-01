@@ -92,6 +92,15 @@ class LigoloStartArguments(TaskArguments):
                 ),
                 parameter_group_info=[ParameterGroupInfo(required=False, ui_position=9)],
             ),
+            CommandParameter(
+                name="chunk_size_mb",
+                cli_name="ChunkSizeMB",
+                display_name="Chunk Size (MB)",
+                type=ParameterType.Number,
+                default_value=4,
+                description="Shellcode download chunk size in MB (fork+run only). Larger = fewer round-trips = faster.",
+                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=10)],
+            ),
         ]
 
     async def parse_arguments(self):
@@ -187,8 +196,10 @@ class LigoloStartCommand(CommandBase):
             if proxy_url:       args_parts.append(f"-proxy {proxy_url}")
             if user_agent_val:  args_parts.append(f'-ua "{user_agent_val}"')
 
+            chunk_size = int(taskData.args.get_arg("chunk_size_mb") or 4) * 1024 * 1024
             taskData.args.add_arg("shellcode_file_id", file_id, ParameterType.String)
             taskData.args.add_arg("ligolo_args", " ".join(args_parts), ParameterType.String)
+            taskData.args.add_arg("sc_chunk_size", int(chunk_size), ParameterType.Number)
             response.DisplayParams = f"fork+run (spawnto) | {target}"
         else:
             response.DisplayParams = f"{target} -> {remote_path}"
