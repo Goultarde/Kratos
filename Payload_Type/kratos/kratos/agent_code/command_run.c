@@ -10,7 +10,6 @@
 void command_run(char *task_id, char *params) {
   char executable[512] = {0};
   char arguments[1024] = {0};
-  char full_cmd[2048] = {0};
 
   if (params[0] == '{') {
     extract_json_string(params, "executable", executable, sizeof(executable));
@@ -19,14 +18,12 @@ void command_run(char *task_id, char *params) {
     strncpy(arguments, params, sizeof(arguments) - 1);
   }
 
-  if (strlen(executable) > 0) {
-    snprintf(full_cmd, sizeof(full_cmd), "%s %s", executable, arguments);
-  } else {
-    strncpy(full_cmd, arguments, sizeof(full_cmd) - 1);
+  if (strlen(executable) == 0) {
+    send_task_response(task_id, "Error: executable is required for run");
+    return;
   }
 
-  printf("Executing run: %s\n", full_cmd);
-  char *output = execute_shell(full_cmd);
+  char *output = execute_process(executable, arguments);
   send_task_response(task_id, output);
   if (output)
     free(output);

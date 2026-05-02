@@ -1,4 +1,11 @@
-SRC = main.c Checkin.c utils.c crypto.c evasion.c \
+SRC = main.c Checkin.c utils.c crypto.c evasion.c
+
+# .S stub is only needed when syscalls are enabled
+ifneq (,$(findstring EVASION_SYSCALLS,$(CFLAGS)))
+    SRC += syscall_stub.S
+endif
+
+SRC += \
       command_shell.c command_run.c command_getuid.c \
       command_pwd.c command_cd.c command_ls.c \
       command_sleep.c command_exit.c \
@@ -11,6 +18,8 @@ SRC = main.c Checkin.c utils.c crypto.c evasion.c \
       command_ligolo.c \
       command_spawn.c \
       command_spawnas.c \
+      command_blockdlls.c \
+      command_execute_assembly.c \
       inject.c
 
 # Crypto backend: USE_BCRYPT (default) or USE_TINY_AES

