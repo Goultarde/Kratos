@@ -96,8 +96,8 @@ class SpawnAsCommand(CommandBase):
     help_cmd = "spawnas (modal popup)"
     description = (
         "Spawn a new Kratos session inside the spawnto process under another user's credentials. "
-        "Uses CreateProcessWithLogonW with LOGON_NETCREDENTIALS_ONLY (network token, no local profile). "
-        "Useful when credentials are known but no token is available."
+        "Uses CreateProcessWithLogonW with LOGON_WITH_PROFILE (full user token). "
+        "Leave domain empty to let Windows auto-resolve (domain accounts). Use '.' for local accounts."
     )
     version = 1
     author = "@goultarde"

