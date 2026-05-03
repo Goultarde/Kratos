@@ -126,7 +126,7 @@ class RunAsCommand(CommandBase):
                 realm = ""
                 account = username
             else:
-                realm = taskData.Callback.Host
+                realm = ""
                 account = username
 
         # Flatten fields: C agent expects top-level account/realm/credential keys

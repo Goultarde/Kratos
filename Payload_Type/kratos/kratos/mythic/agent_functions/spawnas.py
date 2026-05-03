@@ -38,8 +38,8 @@ class SpawnAsArguments(TaskArguments):
                 cli_name="Domain",
                 display_name="Domain",
                 type=ParameterType.String,
-                default_value=".",
-                description="Domain or '.' for local accounts.",
+                default_value="",
+                description="Domain name for domain accounts, '.' for local accounts, or leave empty to auto-resolve.",
                 parameter_group_info=[ParameterGroupInfo(required=False, ui_position=3)],
             ),
             CommandParameter(
