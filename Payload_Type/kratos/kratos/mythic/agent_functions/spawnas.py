@@ -15,14 +15,27 @@ class SpawnAsArguments(TaskArguments):
                 type=ParameterType.ChooseOne,
                 dynamic_query_function=self.get_shellcode_payloads,
                 description="Kratos shellcode payload to inject into the spawnto process",
-                parameter_group_info=[ParameterGroupInfo(required=True, ui_position=0)],
+                parameter_group_info=[
+                    ParameterGroupInfo(required=True, ui_position=0),
+                    ParameterGroupInfo(group_name="credential_store", required=True, ui_position=0),
+                ],
+            ),
+            CommandParameter(
+                name="credential",
+                cli_name="Credential",
+                display_name="Credential",
+                type=ParameterType.Credential_JSON,
+                limit_credentials_by_type=["plaintext"],
+                parameter_group_info=[
+                    ParameterGroupInfo(group_name="credential_store", required=True, ui_position=1),
+                ],
             ),
             CommandParameter(
                 name="username",
                 cli_name="Username",
                 display_name="Username",
                 type=ParameterType.String,
-                description="Account username to spawn as.",
+                description="Account username to spawn as. Format: DOMAIN\\user, user@domain, or user (local).",
                 parameter_group_info=[ParameterGroupInfo(required=True, ui_position=1)],
             ),
             CommandParameter(
@@ -43,13 +56,36 @@ class SpawnAsArguments(TaskArguments):
                 parameter_group_info=[ParameterGroupInfo(required=False, ui_position=3)],
             ),
             CommandParameter(
+                name="logon_type",
+                cli_name="LogonType",
+                display_name="Logon Type",
+                type=ParameterType.ChooseOne,
+                choices=["2 - Interactive", "3 - Network", "4 - Batch", "5 - Service", "8 - NetworkCleartext", "9 - NewCredentials"],
+                default_value="2 - Interactive",
+                description=(
+                    "2=Interactive (CreateProcessWithLogonW, full token), "
+                    "3=Network (LogonUser+SetThreadToken, SeImpersonatePrivilege required), "
+                    "4=Batch (LogonUser+SetThreadToken, SeBatchLogonRight on target), "
+                    "5=Service (LogonUser+SetThreadToken, SeServiceLogonRight on target), "
+                    "8=NetworkCleartext (LogonUser+SetThreadToken, creds stay in memory), "
+                    "9=NewCredentials (CreateProcessWithLogonW, inherits current token)"
+                ),
+                parameter_group_info=[
+                    ParameterGroupInfo(required=False, ui_position=4),
+                    ParameterGroupInfo(group_name="credential_store", required=False, ui_position=2),
+                ],
+            ),
+            CommandParameter(
                 name="push_mode",
                 cli_name="PushMode",
                 display_name="Push Mode",
                 type=ParameterType.Boolean,
                 default_value=False,
                 description="Send shellcode in a single chunk. Faster but larger get_tasking response.",
-                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=4)],
+                parameter_group_info=[
+                    ParameterGroupInfo(required=False, ui_position=5),
+                    ParameterGroupInfo(group_name="credential_store", required=False, ui_position=3),
+                ],
             ),
             CommandParameter(
                 name="chunk_size_mb",
@@ -58,7 +94,27 @@ class SpawnAsArguments(TaskArguments):
                 type=ParameterType.Number,
                 default_value=4,
                 description="Shellcode download chunk size in MB (pull mode only).",
-                parameter_group_info=[ParameterGroupInfo(required=False, ui_position=5)],
+                parameter_group_info=[
+                    ParameterGroupInfo(required=False, ui_position=6),
+                    ParameterGroupInfo(group_name="credential_store", required=False, ui_position=4),
+                ],
+            ),
+            CommandParameter(
+                name="bypass_uac",
+                cli_name="b",
+                display_name="Bypass UAC (-b)",
+                type=ParameterType.Boolean,
+                default_value=False,
+                description=(
+                    "UAC bypass: LogonUser (non-filtered type) + copy IL + strip DACL + "
+                    "ImpersonateLoggedOnUser + CreateProcessWithLogonW(LOGON_NETCREDENTIALS_ONLY). "
+                    "Only effective for logon types 2/9. "
+                    "Fails with err 1326 on hardened Windows 10/11 without permissive LSA policy."
+                ),
+                parameter_group_info=[
+                    ParameterGroupInfo(required=False, ui_position=7),
+                    ParameterGroupInfo(group_name="credential_store", required=False, ui_position=5),
+                ],
             ),
         ]
 
@@ -111,10 +167,29 @@ class SpawnAsCommand(CommandBase):
             Success=True,
         )
 
-        username = taskData.args.get_arg("username") or ""
-        domain   = taskData.args.get_arg("domain") or "."
+        if taskData.args.get_parameter_group_name() == "credential_store":
+            cred     = taskData.args.get_arg("credential")
+            username = cred.get("account", "") if isinstance(cred, dict) else ""
+            domain   = cred.get("realm",   "") if isinstance(cred, dict) else ""
+            password = cred.get("credential", "") if isinstance(cred, dict) else ""
+            taskData.args.remove_arg("credential")
+            taskData.args.add_arg("username", username, type=ParameterType.String)
+            taskData.args.add_arg("password", password, type=ParameterType.String)
+            taskData.args.add_arg("domain",   domain,   type=ParameterType.String)
+        else:
+            username = taskData.args.get_arg("username") or ""
+            domain   = taskData.args.get_arg("domain") or ""
+
         if not username:
             raise Exception("username is required")
+
+        # Resolve logon_type to integer
+        logon_choice = taskData.args.get_arg("logon_type") or "2 - Interactive"
+        logon_type_int = int(logon_choice.split(" ")[0])
+        taskData.args.remove_arg("logon_type")
+        taskData.args.add_arg("logon_type", logon_type_int, type=ParameterType.Number)
+        logon_labels = {2: "Interactive", 3: "Network", 4: "Batch", 5: "Service", 8: "NetworkCleartext", 9: "NewCredentials"}
+        logon_label = logon_labels.get(logon_type_int, str(logon_type_int))
 
         raw = taskData.args.get_arg("template")
         if raw.startswith("[") and "]" in raw:
@@ -159,7 +234,11 @@ class SpawnAsCommand(CommandBase):
             phase = resp.Payloads[0].BuildPhase
             if phase == "success":
                 file_id = resp.Payloads[0].AgentFileId
-                response.DisplayParams = f"spawning as {domain}\\{username} from '{template.Description}'"
+                bypass_uac = taskData.args.get_arg("bypass_uac") or False
+                display = f"spawning as {domain}\\{username} [{logon_label}] from '{template.Description}'"
+                if bypass_uac:
+                    display += " [bypass_uac]"
+                response.DisplayParams = display
                 break
             elif phase == "error":
                 raise Exception("Payload build failed")

